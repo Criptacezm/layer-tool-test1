@@ -1,0 +1,13 @@
+Layer - Inbox View (Modern Card Layout)
+
+Layer - My Issues View (with Delete Support)
+
+Layer - Backlog View (Clean Professional Layout)
+
+Layer - Schedule / Calendar View - Single Expanded Task Only
+
+Layer - Activities/Projects View
+
+Layer - Teams View
+
+Layer - Settings View (Professional Layout)
