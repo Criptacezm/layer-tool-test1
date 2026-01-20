@@ -22,6 +22,8 @@ let gripResizeStartSize = { width: 200, height: 120 };
 let gripResizeStartPos = { x: 0, y: 0 };
 let gripIsInitialOpen = false; // Track initial open for animation
 let gripEraserMode = false; // NEW: Eraser mode for deleting connections
+let gripDragAnimationFrame = null; // For smooth dragging with requestAnimationFrame
+let gripLastDragTime = 0; // Throttle drag updates
 
 // Text boxes state
 let gripTextBoxes = [];
@@ -71,6 +73,13 @@ let gripBacklogOpen = false;
 let gripBacklogItems = [];
 let gripBacklogFilter = 'all'; // 'all', 'todo', 'in_progress', 'done'
 
+// Minimap state
+let gripMinimapMinimized = false;
+
+// Multi-select dragging state
+let gripIsMultiDragging = false;
+let gripMultiDragStartPositions = {};
+
 const GRIP_COLORS = [
   '#3b82f6', // Blue
   '#10b981', // Green
@@ -90,6 +99,69 @@ const MIN_CELL_HEIGHT = 80;
 // ============================================
 // Grip Diagram Core Functions
 // ============================================
+
+// Lightweight update function that preserves scroll position
+function updateGripUI() {
+  renderGripCells();
+  renderGripConnections();
+  renderGripTextBoxes();
+  renderGripImages();
+  renderMinimap();
+  updateToolbarState();
+}
+
+// Update toolbar visual state without full re-render
+function updateToolbarState() {
+  // Update tool buttons
+  document.querySelectorAll('.grip-tool-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.tool === gripActiveTool);
+  });
+  
+  // Update eraser button
+  const eraserBtn = document.getElementById('eraserModeBtn');
+  if (eraserBtn) {
+    eraserBtn.classList.toggle('active', gripEraserMode);
+  }
+  
+  // Update connect button
+  const connectBtn = document.getElementById('connectModeBtn');
+  if (connectBtn) {
+    connectBtn.classList.toggle('active', gripConnectMode);
+  }
+  
+  // Update canvas classes
+  const canvas = document.getElementById('gripCanvas');
+  if (canvas) {
+    canvas.classList.toggle('pan-mode', gripActiveTool === 'pan');
+    canvas.classList.toggle('eraser-mode', gripEraserMode);
+  }
+}
+
+// Open the cell editor panel without full re-render
+function openCellEditor(cellId) {
+  const cell = gripCells.find(c => c.id === cellId);
+  if (!cell) return;
+  
+  // Check if editor already exists
+  let editor = document.getElementById('gripCellEditor');
+  if (!editor) {
+    // Create editor container in sidebar
+    const sidebar = document.querySelector('.grip-diagram-sidebar');
+    if (sidebar) {
+      const editorHtml = renderGripCellEditor();
+      sidebar.insertAdjacentHTML('afterbegin', editorHtml);
+    }
+  }
+  setTimeout(setupEditorEventListeners, 0);
+}
+
+// Close the cell editor panel without full re-render
+function closeCellEditor() {
+  const editor = document.getElementById('gripCellEditor');
+  if (editor) {
+    editor.remove();
+  }
+}
 
 function openGripDiagram(projectIndex) {
   gripProjectIndex = projectIndex;
@@ -273,6 +345,13 @@ function renderGripDiagramOverlay() {
             <span>Backlog</span>
             <span class="backlog-count">${backlogStats.todo + backlogStats.in_progress}</span>
           </button>
+          <button type="button" class="header-action-btn ${whiteboardDocSidebarOpen ? 'active' : ''}" id="whiteboardDocToggleBtn" onclick="toggleWhiteboardDocSidebar()" title="View linked documents">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+            </svg>
+            <span>Docs</span>
+          </button>
         </div>
         <div class="grip-header-right">
           <div class="zoom-controls">
@@ -305,34 +384,73 @@ function renderGripDiagramOverlay() {
       
       <!-- Main Content Area -->
       <div class="grip-diagram-body clickup-body">
-        <!-- Canvas Area -->
-        <div class="grip-canvas-wrapper ${gripBacklogOpen ? 'with-backlog' : ''}">
-          <div class="grip-diagram-canvas clickup-canvas ${gripActiveTool === 'pan' ? 'pan-mode' : ''} ${gripEraserMode ? 'eraser-mode' : ''}" id="gripCanvas">
-            <div class="grip-canvas-transform" id="gripCanvasTransform" style="transform: scale(${gripZoomLevel}); transform-origin: 0 0;">
-              <svg class="grip-connections-layer" id="gripConnectionsSvg"></svg>
-              <div class="grip-cells-layer" id="gripCellsContainer"></div>
-              <div class="grip-images-layer" id="gripImagesContainer"></div>
-              <div class="grip-textboxes-layer" id="gripTextBoxesContainer"></div>
-            </div>
+        <!-- Split View Container -->
+        <div class="whiteboard-split-container ${whiteboardSplitViewDocId ? 'split-mode' : ''}" id="whiteboardSplitContainer">
+          <!-- Canvas Area -->
+          <div class="grip-canvas-wrapper ${gripBacklogOpen ? 'with-backlog' : ''}">
+            <div class="grip-diagram-canvas clickup-canvas ${gripActiveTool === 'pan' ? 'pan-mode' : ''} ${gripEraserMode ? 'eraser-mode' : ''}" id="gripCanvas">
+              <div class="grip-canvas-transform" id="gripCanvasTransform" style="transform: scale(${gripZoomLevel}); transform-origin: 0 0;">
+                <svg class="grip-connections-layer" id="gripConnectionsSvg"></svg>
+                <div class="grip-cells-layer" id="gripCellsContainer"></div>
+                <div class="grip-images-layer" id="gripImagesContainer"></div>
+                <div class="grip-textboxes-layer" id="gripTextBoxesContainer"></div>
+              </div>
             ${gripIsDraggingConnection ? '<div class="grip-connect-hint">Release on another cell to connect</div>' : ''}
-            ${gripEraserMode ? '<div class="grip-eraser-hint">Click on connections to delete them • Press E or Esc to exit</div>' : ''}
+              ${gripEraserMode ? '<div class="grip-eraser-hint">Click on connections to delete them • Press E or Esc to exit</div>' : ''}
+            </div>
+            
+            <!-- Minimap -->
+            <div class="grip-minimap ${gripMinimapMinimized ? 'minimized' : ''}" id="gripMinimap">
+              <div class="minimap-header">
+                <span class="minimap-title">Minimap</span>
+                <button class="minimap-toggle" id="minimapToggleBtn" title="${gripMinimapMinimized ? 'Expand' : 'Minimize'}">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    ${gripMinimapMinimized ? '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>' : '<path d="M4 14h6v6M14 4h6v6M20 10l-6 6M4 14l6-6"/>'}
+                  </svg>
+                </button>
+              </div>
+              <div class="minimap-content" id="minimapContent">
+                <canvas id="minimapCanvas" width="180" height="120"></canvas>
+                <div class="minimap-viewport" id="minimapViewport"></div>
+              </div>
+            </div>
+            
+            <!-- Selection info bar -->
+            ${gripSelectedCellIds.length > 1 ? `
+              <div class="selection-info-bar">
+                <span>${gripSelectedCellIds.length} items selected</span>
+                <button class="selection-action" id="deleteSelectedBtn">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m5 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+                  Delete
+                </button>
+                <button class="selection-action" id="duplicateSelectedBtn">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+                  Duplicate
+                </button>
+                <button class="selection-action" id="clearSelectionBtn">Clear</button>
+              </div>
+            ` : ''}
+            
+            <!-- Whiteboard Document Sidebar (When not in split mode) -->
+            <div class="whiteboard-doc-sidebar ${whiteboardDocSidebarOpen && !whiteboardSplitViewDocId ? 'open' : ''}" id="whiteboardDocSidebar">
+              <div class="whiteboard-doc-header">
+                <span class="whiteboard-doc-sidebar-title">Linked Documents</span>
+                <button class="whiteboard-doc-close" onclick="toggleWhiteboardDocSidebar()">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;">
+                    <path d="M18 6L6 18M6 6l12 12"/>
+                  </svg>
+                </button>
+              </div>
+              <div class="whiteboard-doc-content" id="whiteboardDocContent">
+                <!-- Content populated by updateWhiteboardDocSidebar() -->
+              </div>
+            </div>
           </div>
           
-          <!-- Selection info bar -->
-          ${gripSelectedCellIds.length > 1 ? `
-            <div class="selection-info-bar">
-              <span>${gripSelectedCellIds.length} items selected</span>
-              <button class="selection-action" id="deleteSelectedBtn">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m5 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
-                Delete
-              </button>
-              <button class="selection-action" id="duplicateSelectedBtn">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
-                Duplicate
-              </button>
-              <button class="selection-action" id="clearSelectionBtn">Clear</button>
-            </div>
-          ` : ''}
+          <!-- Document Panel (Split View) -->
+          <div class="whiteboard-doc-panel ${whiteboardSplitViewDocId ? '' : 'hidden'}" id="whiteboardDocPanel">
+            <!-- Content populated by updateSplitViewPanel() -->
+          </div>
         </div>
         
         <!-- Backlog Panel -->
@@ -437,8 +555,10 @@ function renderGripDiagramOverlay() {
                   <rect x="3" y="3" width="18" height="18" rx="2"/>
                   <path d="M9 12l2 2 4-4"/>
                 </svg>
-                <span>Task Cell</span>
-                <small>Simple task card</small>
+                <div class="dropup-item-content">
+                  <span>Task Cell</span>
+                  <small>Simple task card</small>
+                </div>
               </button>
               <button type="button" class="dropup-item" onclick="addDrawerCell(); closeCellTypeMenu();">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -447,8 +567,20 @@ function renderGripDiagramOverlay() {
                   <line x1="8" y1="13" x2="16" y2="13"/>
                   <line x1="8" y1="17" x2="16" y2="17"/>
                 </svg>
-                <span>Drawer Cell</span>
-                <small>List with connectable items</small>
+                <div class="dropup-item-content">
+                  <span>Drawer Cell</span>
+                  <small>List with connectable items</small>
+                </div>
+              </button>
+              <button type="button" class="dropup-item" onclick="addCodeContainerCell(); closeCellTypeMenu();">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <polyline points="16 18 22 12 16 6"/>
+                  <polyline points="8 6 2 12 8 18"/>
+                </svg>
+                <div class="dropup-item-content">
+                  <span>Code Container</span>
+                  <small>Code snippet block</small>
+                </div>
               </button>
             </div>
           </div>
@@ -507,18 +639,22 @@ function renderGripDiagramOverlay() {
       
       ${gripSelectedCellId ? renderGripCellEditor() : ''}
       
-      <!-- AI Chat Box -->
-      <div class="grip-ai-chat" id="gripAiChat" style="display: none;">
+      <!-- AI Chat Backdrop -->
+      <div class="grip-ai-chat-backdrop" id="gripAiChatBackdrop"></div>
+      
+      <!-- AI Chat Sidebar (Left) -->
+      <div class="grip-ai-chat" id="gripAiChat">
         <div class="grip-ai-chat-header">
-          <h4>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <circle cx="12" cy="12" r="10"/>
-              <path d="M8 14s1.5 2 4 2 4-2 4-2"/>
-              <line x1="9" y1="9" x2="9.01" y2="9"/>
-              <line x1="15" y1="9" x2="15.01" y2="9"/>
+          <div class="grip-ai-chat-brand">
+            <svg class="grip-ai-brain-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M12 2a4 4 0 0 1 4 4c0 1.1-.9 2-2 2h-4a2 2 0 0 1-2-2 4 4 0 0 1 4-4z"/>
+              <path d="M8 8v1a4 4 0 0 0 8 0V8"/>
+              <path d="M12 12v10"/>
+              <path d="M8 17h8"/>
+              <circle cx="12" cy="5" r="1"/>
             </svg>
-            Project Assistant
-          </h4>
+            <h4>Project Assistant</h4>
+          </div>
           <button type="button" class="grip-ai-chat-close" id="gripAiChatClose">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M18 6L6 18M6 6l12 12"/>
@@ -526,8 +662,8 @@ function renderGripDiagramOverlay() {
           </button>
         </div>
         <div class="grip-ai-chat-messages" id="gripAiMessages">
-          <div class="grip-ai-message assistant">
-            Hey! I'm here to help with your project. What do you need?
+          <div class="grip-ai-welcome">
+            Hi! I'm your project assistant. Ask me anything about your diagram, tasks, or let me help you brainstorm ideas.
           </div>
         </div>
         <div class="grip-ai-chat-input">
@@ -558,6 +694,171 @@ function renderGripDiagramOverlay() {
   renderGripImages();
   setupImageListeners();
   applyZoom();
+  renderMinimap();
+  setupMinimapListeners();
+}
+
+// ============================================
+// Minimap Functions
+// ============================================
+
+function renderMinimap() {
+  const canvas = document.getElementById('minimapCanvas');
+  const minimapContent = document.getElementById('minimapContent');
+  if (!canvas || !minimapContent || gripMinimapMinimized) return;
+  
+  const ctx = canvas.getContext('2d');
+  const canvasEl = document.getElementById('gripCanvas');
+  if (!canvasEl) return;
+  
+  // Clear canvas
+  ctx.fillStyle = '#1a1a1b';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  
+  if (gripCells.length === 0) {
+    ctx.fillStyle = '#3f3f46';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No cells', canvas.width / 2, canvas.height / 2);
+    return;
+  }
+  
+  // Find bounds of all cells
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  gripCells.forEach(cell => {
+    minX = Math.min(minX, cell.x);
+    minY = Math.min(minY, cell.y);
+    maxX = Math.max(maxX, cell.x + (cell.width || 200));
+    maxY = Math.max(maxY, cell.y + (cell.height || 120));
+  });
+  
+  // Add padding
+  const padding = 50;
+  minX = Math.max(0, minX - padding);
+  minY = Math.max(0, minY - padding);
+  maxX += padding;
+  maxY += padding;
+  
+  const contentWidth = maxX - minX || 1;
+  const contentHeight = maxY - minY || 1;
+  
+  // Calculate scale to fit in minimap
+  const scaleX = canvas.width / contentWidth;
+  const scaleY = canvas.height / contentHeight;
+  const scale = Math.min(scaleX, scaleY, 0.15);
+  
+  // Store scale for viewport calculation
+  canvas.dataset.scale = scale;
+  canvas.dataset.offsetX = minX;
+  canvas.dataset.offsetY = minY;
+  canvas.dataset.contentWidth = contentWidth;
+  canvas.dataset.contentHeight = contentHeight;
+  
+  // Draw connections
+  ctx.strokeStyle = '#4b5563';
+  ctx.lineWidth = 1;
+  gripConnections.forEach(conn => {
+    const fromCell = gripCells.find(c => c.id === conn.fromId);
+    const toCell = gripCells.find(c => c.id === conn.toId);
+    if (fromCell && toCell) {
+      const fromX = (fromCell.x + (fromCell.width || 200) / 2 - minX) * scale;
+      const fromY = (fromCell.y + (fromCell.height || 120) / 2 - minY) * scale;
+      const toX = (toCell.x + (toCell.width || 200) / 2 - minX) * scale;
+      const toY = (toCell.y + (toCell.height || 120) / 2 - minY) * scale;
+      ctx.beginPath();
+      ctx.moveTo(fromX, fromY);
+      ctx.lineTo(toX, toY);
+      ctx.stroke();
+    }
+  });
+  
+  // Draw cells
+  gripCells.forEach(cell => {
+    const x = (cell.x - minX) * scale;
+    const y = (cell.y - minY) * scale;
+    const w = (cell.width || 200) * scale;
+    const h = (cell.height || 120) * scale;
+    
+    // Draw cell
+    ctx.fillStyle = cell.headerColor || '#3b82f6';
+    ctx.fillRect(x, y, Math.max(w, 3), Math.max(h, 3));
+    
+    // Highlight selected cells
+    if (gripSelectedCellIds.includes(cell.id) || gripSelectedCellId === cell.id) {
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x, y, Math.max(w, 3), Math.max(h, 3));
+    }
+  });
+  
+  // Update viewport rectangle
+  updateMinimapViewport();
+}
+
+function updateMinimapViewport() {
+  const viewport = document.getElementById('minimapViewport');
+  const canvas = document.getElementById('minimapCanvas');
+  const canvasEl = document.getElementById('gripCanvas');
+  
+  if (!viewport || !canvas || !canvasEl) return;
+  
+  const scale = parseFloat(canvas.dataset.scale) || 0.1;
+  const offsetX = parseFloat(canvas.dataset.offsetX) || 0;
+  const offsetY = parseFloat(canvas.dataset.offsetY) || 0;
+  
+  // Calculate viewport position and size
+  const viewX = (canvasEl.scrollLeft / gripZoomLevel - offsetX) * scale;
+  const viewY = (canvasEl.scrollTop / gripZoomLevel - offsetY) * scale;
+  const viewW = (canvasEl.clientWidth / gripZoomLevel) * scale;
+  const viewH = (canvasEl.clientHeight / gripZoomLevel) * scale;
+  
+  viewport.style.left = Math.max(0, viewX) + 'px';
+  viewport.style.top = Math.max(0, viewY) + 'px';
+  viewport.style.width = Math.min(viewW, canvas.width - Math.max(0, viewX)) + 'px';
+  viewport.style.height = Math.min(viewH, canvas.height - Math.max(0, viewY)) + 'px';
+}
+
+function setupMinimapListeners() {
+  const toggleBtn = document.getElementById('minimapToggleBtn');
+  const minimapCanvas = document.getElementById('minimapCanvas');
+  const canvasEl = document.getElementById('gripCanvas');
+  
+  if (toggleBtn) {
+    toggleBtn.addEventListener('click', () => {
+      gripMinimapMinimized = !gripMinimapMinimized;
+      renderGripDiagramOverlay();
+    });
+  }
+  
+  // Click on minimap to navigate
+  if (minimapCanvas) {
+    minimapCanvas.addEventListener('click', (e) => {
+      if (!canvasEl) return;
+      
+      const rect = minimapCanvas.getBoundingClientRect();
+      const clickX = e.clientX - rect.left;
+      const clickY = e.clientY - rect.top;
+      
+      const scale = parseFloat(minimapCanvas.dataset.scale) || 0.1;
+      const offsetX = parseFloat(minimapCanvas.dataset.offsetX) || 0;
+      const offsetY = parseFloat(minimapCanvas.dataset.offsetY) || 0;
+      
+      // Calculate target scroll position
+      const targetX = (clickX / scale + offsetX) * gripZoomLevel - canvasEl.clientWidth / 2;
+      const targetY = (clickY / scale + offsetY) * gripZoomLevel - canvasEl.clientHeight / 2;
+      
+      canvasEl.scrollTo({
+        left: Math.max(0, targetX),
+        top: Math.max(0, targetY),
+        behavior: 'smooth'
+      });
+    });
+  }
+  
+  // Update viewport on scroll
+  if (canvasEl) {
+    canvasEl.addEventListener('scroll', updateMinimapViewport);
+  }
 }
 
 function renderBacklogItem(item) {
@@ -687,7 +988,8 @@ function toggleGripEraserMode() {
     gripConnectFromId = null;
     gripConnectFromPosition = null;
   }
-  renderGripDiagramOverlay();
+  updateToolbarState();
+  updateGripUI();
 }
 
 // Center canvas view
@@ -720,6 +1022,7 @@ function renderGripCells() {
     const height = cell.height || DEFAULT_CELL_HEIGHT;
     const hasComment = cell.comment && cell.comment.trim().length > 0;
     const isDrawer = cell.isDrawer === true;
+    const isCodeContainer = cell.isCodeContainer === true;
     
     // Render drawer items if this is a drawer cell - with left/right connection points and drag handle
     const drawerItemsHtml = isDrawer && cell.drawerItems ? cell.drawerItems.map((item, idx) => `
@@ -741,11 +1044,23 @@ function renderGripCells() {
       </div>
     `).join('') : '';
     
+    const isMultiSelected = gripSelectedCellIds.includes(cell.id);
+    
+    // Determine cell class
+    let cellClass = 'grip-cell';
+    if (isDrawer) cellClass += ' grip-cell-drawer';
+    if (isCodeContainer) cellClass += ' grip-cell-code';
+    if (gripSelectedCellId === cell.id) cellClass += ' selected';
+    if (isMultiSelected) cellClass += ' multi-selected';
+    if (gripConnectMode) cellClass += ' connect-mode';
+    if (gripConnectFromId === cell.id) cellClass += ' connect-from';
+    
     return `
-    <div class="grip-cell ${isDrawer ? 'grip-cell-drawer' : ''} ${gripSelectedCellId === cell.id ? 'selected' : ''} ${gripConnectMode ? 'connect-mode' : ''} ${gripConnectFromId === cell.id ? 'connect-from' : ''}"
+    <div class="${cellClass}"
          id="gripCell-${cell.id}"
          data-cell-id="${cell.id}"
          data-is-drawer="${isDrawer}"
+         data-is-code="${isCodeContainer}"
          style="left: ${cell.x}px; top: ${cell.y}px; width: ${width}px; min-height: ${height}px;"
          ${hasComment ? `data-comment="${escapeHtml(cell.comment)}"` : ''}>
       
@@ -777,6 +1092,17 @@ function renderGripCells() {
       <div class="grip-cell-header" style="background: ${cell.headerColor};">
         <span class="grip-cell-title">${cell.title || 'Untitled'}</span>
         ${isDrawer ? '<span class="grip-cell-badge">Drawer</span>' : ''}
+        ${isCodeContainer ? `
+          <div class="grip-cell-code-header-right">
+            <span class="grip-cell-code-lang" id="codeLang-${cell.id}">${detectCodeLanguage(cell.content || '')}</span>
+            <button type="button" class="grip-cell-run-btn" onclick="event.stopPropagation(); runCode(${cell.id})" title="Run Code">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;">
+                <polygon points="5 3 19 12 5 21 5 3"/>
+              </svg>
+              Run
+            </button>
+          </div>
+        ` : ''}
       </div>
       
       ${isDrawer ? `
@@ -789,22 +1115,35 @@ function renderGripCells() {
             Add Item
           </button>
         </div>
+      ` : isCodeContainer ? `
+        <div class="grip-cell-code-wrapper">
+          <div class="grip-cell-code-content" contenteditable="true" spellcheck="false" data-cell-id="${cell.id}" 
+               onclick="event.stopPropagation(); this.focus();"
+               onmousedown="event.stopPropagation();"
+               onfocus="this.classList.add('editing');"
+               onblur="this.classList.remove('editing'); updateCodeCellContent(${cell.id}, this.innerText);"
+               oninput="updateCodeLanguageDisplay(${cell.id})">${escapeHtml(cell.content || '// Enter code here')}</div>
+          <div class="grip-cell-code-output" id="codeOutput-${cell.id}" style="display:none;">
+            <div class="code-output-header">
+              <span>Output</span>
+              <button type="button" class="code-output-close" onclick="hideCodeOutput(${cell.id})">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;"><path d="M18 6L6 18M6 6l12 12"/></svg>
+              </button>
+            </div>
+            <pre class="code-output-content" id="codeOutputContent-${cell.id}"></pre>
+          </div>
+        </div>
       ` : `
         <div class="grip-cell-content">
           ${cell.content || 'Click to edit...'}
         </div>
       `}
       
-      <!-- Connection Points - Drawer cells only have left/right, regular cells have all 4 -->
-      ${isDrawer ? `
-        <div class="grip-cell-connection-point grip-conn-right" data-cell-id="${cell.id}" data-position="right"></div>
-        <div class="grip-cell-connection-point grip-conn-left" data-cell-id="${cell.id}" data-position="left"></div>
-      ` : `
-        <div class="grip-cell-connection-point grip-conn-top" data-cell-id="${cell.id}" data-position="top"></div>
-        <div class="grip-cell-connection-point grip-conn-right" data-cell-id="${cell.id}" data-position="right"></div>
-        <div class="grip-cell-connection-point grip-conn-bottom" data-cell-id="${cell.id}" data-position="bottom"></div>
-        <div class="grip-cell-connection-point grip-conn-left" data-cell-id="${cell.id}" data-position="left"></div>
-      `}
+      <!-- Connection Points - Drawer cells have all 4 connection points too for more flexibility -->
+      <div class="grip-cell-connection-point grip-conn-top" data-cell-id="${cell.id}" data-position="top"></div>
+      <div class="grip-cell-connection-point grip-conn-right" data-cell-id="${cell.id}" data-position="right"></div>
+      <div class="grip-cell-connection-point grip-conn-bottom" data-cell-id="${cell.id}" data-position="bottom"></div>
+      <div class="grip-cell-connection-point grip-conn-left" data-cell-id="${cell.id}" data-position="left"></div>
       
       <!-- Resize Handles -->
       <div class="grip-cell-resize-handle grip-resize-e" data-cell-id="${cell.id}" data-direction="e"></div>
@@ -886,7 +1225,12 @@ function renderGripCells() {
         editBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           gripSelectedCellId = cell.id;
-          renderGripDiagramOverlay();
+          // Immediately show editor without full re-render to prevent glitch
+          const editorHtml = renderGripCellEditor();
+          const existingEditor = document.getElementById('gripCellEditor');
+          if (existingEditor) existingEditor.remove();
+          document.querySelector('.grip-diagram-body')?.insertAdjacentHTML('beforeend', editorHtml);
+          updateGripUI();
           setTimeout(setupEditorEventListeners, 0);
         });
         editBtn.addEventListener('mousedown', (e) => e.stopPropagation());
@@ -907,8 +1251,9 @@ function renderGripConnections() {
 
   const canvas = document.getElementById('gripCanvas');
   if (canvas) {
-    const minWidth = Math.max(canvas.scrollWidth, canvas.clientWidth, 2000);
-    const minHeight = Math.max(canvas.scrollHeight, canvas.clientHeight, 2000);
+    // Make SVG large enough to cover all content even when zoomed out
+    const minWidth = Math.max(canvas.scrollWidth, canvas.clientWidth, 4000) / gripZoomLevel;
+    const minHeight = Math.max(canvas.scrollHeight, canvas.clientHeight, 4000) / gripZoomLevel;
     svg.setAttribute('width', minWidth);
     svg.setAttribute('height', minHeight);
     svg.style.width = minWidth + 'px';
@@ -917,17 +1262,17 @@ function renderGripConnections() {
 
   let svgContent = '';
   
-  // Add professional arrow marker definitions
+  // Add professional arrow marker definitions - ORANGE theme
   svgContent += `
     <defs>
       <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
-        <path d="M0,0 L0,6 L8,3 z" fill="#4b5563"/>
+        <path d="M0,0 L0,6 L8,3 z" fill="#f97316"/>
       </marker>
       <marker id="arrowhead-hover" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
         <path d="M0,0 L0,6 L8,3 z" fill="#dc2626"/>
       </marker>
       <marker id="arrowhead-drawer" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
-        <path d="M0,0 L0,6 L8,3 z" fill="#10b981"/>
+        <path d="M0,0 L0,6 L8,3 z" fill="#fb923c"/>
       </marker>
       <marker id="arrowhead-drawer-hover" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
         <path d="M0,0 L0,6 L8,3 z" fill="#dc2626"/>
@@ -986,8 +1331,8 @@ function renderGripConnections() {
 
     const path = `M ${fromPoint.x} ${fromPoint.y} C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${toPoint.x} ${toPoint.y}`;
     
-    // Use different colors for drawer item connections - more subtle for minimalistic look
-    const strokeColor = isDrawerConnection ? '#10b981' : '#4b5563';
+    // Use ORANGE colors for connections - minimalistic look
+    const strokeColor = isDrawerConnection ? '#fb923c' : '#f97316';
     const markerEnd = isDrawerConnection ? 'url(#arrowhead-drawer)' : 'url(#arrowhead)';
 
     // Calculate midpoint for delete button
@@ -1055,7 +1400,7 @@ function renderGripConnections() {
         }
         
         const isDrawer = group.dataset.isDrawer === 'true';
-        const originalColor = group.dataset.strokeColor || (isDrawer ? '#10b981' : '#4b5563');
+        const originalColor = group.dataset.strokeColor || (isDrawer ? '#fb923c' : '#f97316');
         group.querySelector('.grip-connection-path').style.stroke = originalColor;
         group.querySelector('.grip-connection-path').setAttribute('marker-end', isDrawer ? 'url(#arrowhead-drawer)' : 'url(#arrowhead)');
         group.querySelector('.grip-connection-dot').style.fill = originalColor;
@@ -1075,7 +1420,7 @@ function renderGripConnections() {
       
       deleteIndicator.addEventListener('mouseleave', () => {
         const isDrawer = group.dataset.isDrawer === 'true';
-        const originalColor = group.dataset.strokeColor || (isDrawer ? '#10b981' : '#4b5563');
+        const originalColor = group.dataset.strokeColor || (isDrawer ? '#fb923c' : '#f97316');
         group.querySelector('.grip-connection-path').style.stroke = originalColor;
         group.querySelector('.grip-connection-path').setAttribute('marker-end', isDrawer ? 'url(#arrowhead-drawer)' : 'url(#arrowhead)');
         group.querySelector('.grip-connection-dot').style.fill = originalColor;
@@ -1164,6 +1509,55 @@ function renderGripCellEditor() {
   const cell = gripCells.find(c => c.id === gripSelectedCellId);
   if (!cell) return '';
 
+  const isCodeContainer = cell.isCodeContainer === true;
+
+  // For code containers, show only Title, Comment, and Header Color
+  if (isCodeContainer) {
+    return `
+      <div class="grip-cell-editor" id="gripCellEditor">
+        <div class="grip-editor-header">
+          <h3>Edit Code Cell</h3>
+          <button type="button" class="grip-editor-close" id="gripEditorClose">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M18 6L6 18M6 6l12 12"/>
+            </svg>
+          </button>
+        </div>
+        <div class="grip-editor-content">
+          <div class="grip-editor-field">
+            <label>Title</label>
+            <input type="text" id="gripCellTitle" value="${cell.title || ''}" placeholder="Code cell title...">
+          </div>
+          <div class="grip-editor-field">
+            <label>Comment (shows on hover)</label>
+            <textarea id="gripCellComment" placeholder="Add a comment that appears when hovering...">${cell.comment || ''}</textarea>
+          </div>
+          <div class="grip-editor-field">
+            <label>Header Color</label>
+            <div class="grip-color-picker" id="gripColorPicker">
+              ${GRIP_COLORS.map(color => `
+                <button type="button" class="grip-color-btn ${cell.headerColor === color ? 'active' : ''}"
+                        style="background: ${color};"
+                        data-color="${color}">
+                </button>
+              `).join('')}
+            </div>
+          </div>
+          <p class="grip-editor-hint">Tip: Click directly in the code area on the cell to edit your code.</p>
+          <div class="grip-editor-actions">
+            <button type="button" class="btn btn-destructive" id="gripDeleteBtn">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 16px; height: 16px;">
+                <path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m5 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/>
+              </svg>
+              Delete Cell
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // Default editor for regular and drawer cells
   return `
     <div class="grip-cell-editor" id="gripCellEditor">
       <div class="grip-editor-header">
@@ -1231,6 +1625,8 @@ function setupEditorEventListeners() {
   const cell = gripCells.find(c => c.id === gripSelectedCellId);
   if (!cell) return;
 
+  const isCodeContainer = cell.isCodeContainer === true;
+
   // Close button
   document.getElementById('gripEditorClose').addEventListener('click', deselectGripCell);
   
@@ -1239,10 +1635,13 @@ function setupEditorEventListeners() {
     updateGripCellTitle(cell.id, e.target.value);
   });
   
-  // Content textarea
-  document.getElementById('gripCellContent').addEventListener('input', (e) => {
-    updateGripCellContent(cell.id, e.target.value);
-  });
+  // Content textarea - only for non-code cells
+  const contentInput = document.getElementById('gripCellContent');
+  if (contentInput && !isCodeContainer) {
+    contentInput.addEventListener('input', (e) => {
+      updateGripCellContent(cell.id, e.target.value);
+    });
+  }
   
   // Comment textarea
   const commentInput = document.getElementById('gripCellComment');
@@ -1252,22 +1651,24 @@ function setupEditorEventListeners() {
     });
   }
   
-  // Size inputs
-  const widthInput = document.getElementById('gripCellWidth');
-  const heightInput = document.getElementById('gripCellHeight');
-  
-  if (widthInput) {
-    widthInput.addEventListener('change', (e) => {
-      const newWidth = Math.max(MIN_CELL_WIDTH, parseInt(e.target.value) || DEFAULT_CELL_WIDTH);
-      updateGripCellSize(cell.id, newWidth, cell.height || DEFAULT_CELL_HEIGHT);
-    });
-  }
-  
-  if (heightInput) {
-    heightInput.addEventListener('change', (e) => {
-      const newHeight = Math.max(MIN_CELL_HEIGHT, parseInt(e.target.value) || DEFAULT_CELL_HEIGHT);
-      updateGripCellSize(cell.id, cell.width || DEFAULT_CELL_WIDTH, newHeight);
-    });
+  // Size inputs - only for non-code cells
+  if (!isCodeContainer) {
+    const widthInput = document.getElementById('gripCellWidth');
+    const heightInput = document.getElementById('gripCellHeight');
+    
+    if (widthInput) {
+      widthInput.addEventListener('change', (e) => {
+        const newWidth = Math.max(MIN_CELL_WIDTH, parseInt(e.target.value) || DEFAULT_CELL_WIDTH);
+        updateGripCellSize(cell.id, newWidth, cell.height || DEFAULT_CELL_HEIGHT);
+      });
+    }
+    
+    if (heightInput) {
+      heightInput.addEventListener('change', (e) => {
+        const newHeight = Math.max(MIN_CELL_HEIGHT, parseInt(e.target.value) || DEFAULT_CELL_HEIGHT);
+        updateGripCellSize(cell.id, cell.width || DEFAULT_CELL_WIDTH, newHeight);
+      });
+    }
   }
   
   // Color picker
@@ -1303,15 +1704,59 @@ function handleGripCellMouseDown(event, cellId) {
   const cell = gripCells.find(c => c.id === cellId);
   if (!cell) return;
 
-  gripDraggingCellId = cellId;
-  gripIsDragging = false;
-  
   const canvas = document.getElementById('gripCanvas');
   const canvasRect = canvas.getBoundingClientRect();
   
+  // Handle Shift+Click for multi-select
+  if (event.shiftKey) {
+    if (gripSelectedCellIds.includes(cellId)) {
+      gripSelectedCellIds = gripSelectedCellIds.filter(id => id !== cellId);
+    } else {
+      gripSelectedCellIds.push(cellId);
+    }
+    gripSelectedCellId = gripSelectedCellIds.length > 0 ? gripSelectedCellIds[0] : null;
+    renderGripCells();
+    return;
+  }
+  
+  // Check if clicking on a cell that's part of multi-selection
+  if (gripSelectedCellIds.includes(cellId) && gripSelectedCellIds.length > 1) {
+    // Start multi-drag
+    gripIsMultiDragging = true;
+    gripDraggingCellId = cellId;
+    gripIsDragging = false;
+    
+    // Store starting positions of all selected cells
+    gripMultiDragStartPositions = {};
+    gripSelectedCellIds.forEach(id => {
+      const c = gripCells.find(cell => cell.id === id);
+      if (c) {
+        gripMultiDragStartPositions[id] = { x: c.x, y: c.y };
+      }
+    });
+    
+    // Calculate offset from click to the dragged cell position, accounting for zoom
+    gripDragOffset = {
+      x: (event.clientX - canvasRect.left + canvas.scrollLeft) / gripZoomLevel - cell.x,
+      y: (event.clientY - canvasRect.top + canvas.scrollTop) / gripZoomLevel - cell.y
+    };
+    
+    // Add dragging class to all selected cells
+    gripSelectedCellIds.forEach(id => {
+      const el = document.getElementById(`gripCell-${id}`);
+      if (el) el.classList.add('dragging');
+    });
+    return;
+  }
+
+  gripDraggingCellId = cellId;
+  gripIsDragging = false;
+  gripIsMultiDragging = false;
+  
+  // Calculate drag offset accounting for zoom level
   gripDragOffset = {
-    x: event.clientX - canvasRect.left + canvas.scrollLeft - cell.x,
-    y: event.clientY - canvasRect.top + canvas.scrollTop - cell.y
+    x: (event.clientX - canvasRect.left + canvas.scrollLeft) / gripZoomLevel - cell.x,
+    y: (event.clientY - canvasRect.top + canvas.scrollTop) / gripZoomLevel - cell.y
   };
   
   // Add dragging class
@@ -1328,32 +1773,82 @@ function handleGripMouseMove(event) {
     return;
   }
   
+  // Handle connection dragging
+  if (gripIsDraggingConnection) {
+    handleConnectionDragMove(event);
+    return;
+  }
+  
   if (!gripDraggingCellId) return;
   
   event.preventDefault();
   gripIsDragging = true;
   
-  const canvas = document.getElementById('gripCanvas');
-  if (!canvas) return;
+  // Throttle updates for smooth performance (16ms = ~60fps)
+  const now = performance.now();
+  if (now - gripLastDragTime < 16) return;
+  gripLastDragTime = now;
   
-  const canvasRect = canvas.getBoundingClientRect();
+  // Cancel any pending animation frame
+  if (gripDragAnimationFrame) {
+    cancelAnimationFrame(gripDragAnimationFrame);
+  }
   
-  const newX = Math.max(0, event.clientX - canvasRect.left + canvas.scrollLeft - gripDragOffset.x);
-  const newY = Math.max(0, event.clientY - canvasRect.top + canvas.scrollTop - gripDragOffset.y);
-  
-  const cellIndex = gripCells.findIndex(c => c.id === gripDraggingCellId);
-  if (cellIndex !== -1) {
-    gripCells[cellIndex].x = newX;
-    gripCells[cellIndex].y = newY;
+  // Use requestAnimationFrame for smooth rendering
+  gripDragAnimationFrame = requestAnimationFrame(() => {
+    const canvas = document.getElementById('gripCanvas');
+    if (!canvas) return;
     
-    const cellElement = document.getElementById(`gripCell-${gripDraggingCellId}`);
-    if (cellElement) {
-      cellElement.style.left = `${newX}px`;
-      cellElement.style.top = `${newY}px`;
+    const canvasRect = canvas.getBoundingClientRect();
+    
+    // Calculate new position accounting for zoom level
+    const newX = Math.max(0, (event.clientX - canvasRect.left + canvas.scrollLeft) / gripZoomLevel - gripDragOffset.x);
+    const newY = Math.max(0, (event.clientY - canvasRect.top + canvas.scrollTop) / gripZoomLevel - gripDragOffset.y);
+    
+    // Handle multi-select dragging
+    if (gripIsMultiDragging && gripSelectedCellIds.length > 1) {
+      const primaryCell = gripCells.find(c => c.id === gripDraggingCellId);
+      if (!primaryCell) return;
+      
+      const deltaX = newX - gripMultiDragStartPositions[gripDraggingCellId].x;
+      const deltaY = newY - gripMultiDragStartPositions[gripDraggingCellId].y;
+      
+      // Move all selected cells by the same delta
+      gripSelectedCellIds.forEach(id => {
+        const cellIndex = gripCells.findIndex(c => c.id === id);
+        if (cellIndex !== -1 && gripMultiDragStartPositions[id]) {
+          const nx = Math.max(0, gripMultiDragStartPositions[id].x + deltaX);
+          const ny = Math.max(0, gripMultiDragStartPositions[id].y + deltaY);
+          gripCells[cellIndex].x = nx;
+          gripCells[cellIndex].y = ny;
+          
+          const cellElement = document.getElementById(`gripCell-${id}`);
+          if (cellElement) {
+            cellElement.style.left = `${nx}px`;
+            cellElement.style.top = `${ny}px`;
+          }
+        }
+      });
+      
+      renderGripConnections();
+      return;
     }
     
-    renderGripConnections();
-  }
+    // Single cell drag
+    const cellIndex = gripCells.findIndex(c => c.id === gripDraggingCellId);
+    if (cellIndex !== -1) {
+      gripCells[cellIndex].x = newX;
+      gripCells[cellIndex].y = newY;
+      
+      const cellElement = document.getElementById(`gripCell-${gripDraggingCellId}`);
+      if (cellElement) {
+        cellElement.style.left = `${newX}px`;
+        cellElement.style.top = `${newY}px`;
+      }
+      
+      renderGripConnections();
+    }
+  });
 }
 
 function handleGripMouseUp(event) {
@@ -1363,20 +1858,43 @@ function handleGripMouseUp(event) {
     return;
   }
   
+  // Handle connection drag end
+  if (gripIsDraggingConnection) {
+    handleConnectionDragEnd(event);
+    return;
+  }
+  
+  // Cancel any pending animation frame
+  if (gripDragAnimationFrame) {
+    cancelAnimationFrame(gripDragAnimationFrame);
+    gripDragAnimationFrame = null;
+  }
+  
   if (gripDraggingCellId) {
-    const cellElement = document.getElementById(`gripCell-${gripDraggingCellId}`);
-    if (cellElement) {
-      cellElement.classList.remove('dragging');
+    // Remove dragging class from all selected cells if multi-dragging
+    if (gripIsMultiDragging) {
+      gripSelectedCellIds.forEach(id => {
+        const el = document.getElementById(`gripCell-${id}`);
+        if (el) el.classList.remove('dragging');
+      });
+    } else {
+      const cellElement = document.getElementById(`gripCell-${gripDraggingCellId}`);
+      if (cellElement) {
+        cellElement.classList.remove('dragging');
+      }
     }
     
     if (gripIsDragging) {
       // Update connection positions dynamically after dragging
       updateConnectionPositions();
       saveGripDiagramData(gripProjectIndex);
+      renderMinimap();
     }
     
     gripDraggingCellId = null;
     gripIsDragging = false;
+    gripIsMultiDragging = false;
+    gripMultiDragStartPositions = {};
   }
 }
 
@@ -1617,7 +2135,8 @@ function handleGripCellClick(event, cellId) {
       gripConnectFromId = null;
       gripConnectFromPosition = null;
       gripConnectMode = false;
-      renderGripDiagramOverlay();
+      updateToolbarState();
+      updateGripUI();
     } else if (!gripConnectFromId) {
       gripConnectFromId = cellId;
       renderGripCells();
@@ -1629,7 +2148,8 @@ function handleGripCellClick(event, cellId) {
   // Just deselect if clicking on a different cell
   if (gripSelectedCellId && gripSelectedCellId !== cellId) {
     gripSelectedCellId = null;
-    renderGripDiagramOverlay();
+    closeCellEditor();
+    updateGripUI();
   }
 }
 
@@ -1645,7 +2165,8 @@ function handleConnectionPointClick(cellId, position) {
     gripConnectMode = true;
     gripConnectFromId = cellId;
     gripConnectFromPosition = position;
-    renderGripDiagramOverlay();
+    updateToolbarState();
+    updateGripUI();
     return;
   }
   
@@ -1656,7 +2177,8 @@ function handleConnectionPointClick(cellId, position) {
     gripConnectMode = false;
     gripConnectFromId = null;
     gripConnectFromPosition = null;
-    renderGripDiagramOverlay();
+    updateToolbarState();
+    updateGripUI();
   }
 }
 
@@ -1807,6 +2329,44 @@ function addDrawerCell() {
       { id: 3, text: 'Item 3' }
     ],
     nextDrawerItemId: 4
+  };
+  
+  gripCells.push(newCell);
+  saveGripDiagramData(gripProjectIndex);
+  renderGripCells();
+  renderGripConnections();
+}
+
+// Code Container Cell - a cell for code snippets
+function addCodeContainerCell() {
+  const canvas = document.getElementById('gripCanvas');
+  const canvasWidth = canvas ? canvas.clientWidth : 800;
+  const canvasHeight = canvas ? canvas.clientHeight : 600;
+  
+  const scrollLeft = canvas ? canvas.scrollLeft : 0;
+  const scrollTop = canvas ? canvas.scrollTop : 0;
+  
+  let x = scrollLeft + (canvasWidth / 2) - (DEFAULT_CELL_WIDTH / 2);
+  let y = scrollTop + (canvasHeight / 2) - (DEFAULT_CELL_HEIGHT / 2);
+  
+  const offset = (gripCells.length % 5) * 40;
+  x += offset;
+  y += offset;
+  
+  x = Math.max(50, x);
+  y = Math.max(50, y);
+  
+  const newCell = {
+    id: gripNextCellId++,
+    x: x,
+    y: y,
+    width: DEFAULT_CELL_WIDTH + 80,
+    height: DEFAULT_CELL_HEIGHT + 80,
+    title: `Code ${gripNextCellId - 1}`,
+    content: '// Enter your code here\nfunction example() {\n  return "Hello World";\n}',
+    comment: '',
+    headerColor: '#10b981', // Green for code
+    isCodeContainer: true
   };
   
   gripCells.push(newCell);
@@ -2268,12 +2828,14 @@ function deleteGripCell(cellId) {
   gripSelectedCellId = null;
   
   saveGripDiagramData(gripProjectIndex);
-  renderGripDiagramOverlay();
+  closeCellEditor();
+  updateGripUI();
 }
 
 function deselectGripCell() {
   gripSelectedCellId = null;
-  renderGripDiagramOverlay();
+  closeCellEditor();
+  updateGripUI();
 }
 
 function updateGripCellTitle(cellId, title) {
@@ -2307,6 +2869,389 @@ function updateGripCellContent(cellId, content) {
     saveGripDiagramData(gripProjectIndex);
   }
 }
+
+function updateCodeCellContent(cellId, content) {
+  const cellIndex = gripCells.findIndex(c => c.id === cellId);
+  if (cellIndex !== -1) {
+    gripCells[cellIndex].content = content;
+    saveGripDiagramData(gripProjectIndex);
+    // Update language display
+    updateCodeLanguageDisplay(cellId);
+  }
+}
+
+// ============================================
+// Code Language Detection and Execution
+// ============================================
+
+function detectCodeLanguage(code) {
+  if (!code || typeof code !== 'string') return 'Plain';
+  
+  const trimmed = code.trim().toLowerCase();
+  
+  // Python detection
+  if (/^(import |from .+ import |def |class |print\(|#.*python)/m.test(code) ||
+      /:\s*$/m.test(code) && /^\s+(pass|return|if|for|while)/m.test(code) ||
+      /\bself\./m.test(code)) {
+    return 'Python';
+  }
+  
+  // JavaScript/TypeScript detection
+  if (/^(const |let |var |function |import .+ from|export |async |=>\s*{|console\.log)/m.test(code) ||
+      /\bawait\b/.test(code) ||
+      /\b(document|window)\./m.test(code)) {
+    return 'JavaScript';
+  }
+  
+  // C++ detection
+  if (/#include\s*<|using namespace|int main\s*\(|cout\s*<<|cin\s*>>|std::|void\s+\w+\s*\(/.test(code)) {
+    return 'C++';
+  }
+  
+  // C detection
+  if (/#include\s*<stdio\.h>|printf\s*\(|scanf\s*\(|int main\s*\(/.test(code) && !/#include\s*<iostream>/.test(code)) {
+    return 'C';
+  }
+  
+  // Java detection
+  if (/public\s+(static\s+)?class|System\.out\.print|public\s+static\s+void\s+main/.test(code)) {
+    return 'Java';
+  }
+  
+  // HTML detection
+  if (/^<!DOCTYPE|<html|<head|<body|<div|<span|<p\b/im.test(code)) {
+    return 'HTML';
+  }
+  
+  // CSS detection
+  if (/^[.#]?\w+\s*{[^}]*}|@media|@keyframes|:root\s*{/m.test(code)) {
+    return 'CSS';
+  }
+  
+  // SQL detection
+  if (/^(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|DROP)\s/im.test(code)) {
+    return 'SQL';
+  }
+  
+  // JSON detection
+  if (/^\s*[{\[]/.test(code) && /[}\]]\s*$/.test(code)) {
+    try {
+      JSON.parse(code);
+      return 'JSON';
+    } catch(e) {}
+  }
+  
+  // Shell/Bash detection
+  if (/^(#!\/bin\/|echo\s|cd\s|ls\s|grep\s|chmod\s|sudo\s)/m.test(code)) {
+    return 'Shell';
+  }
+  
+  return 'Plain';
+}
+
+function updateCodeLanguageDisplay(cellId) {
+  const cell = gripCells.find(c => c.id === cellId);
+  if (!cell || !cell.isCodeContainer) return;
+  
+  const langEl = document.getElementById(`codeLang-${cellId}`);
+  if (langEl) {
+    langEl.textContent = detectCodeLanguage(cell.content || '');
+  }
+}
+
+async function runCode(cellId) {
+  const cell = gripCells.find(c => c.id === cellId);
+  if (!cell || !cell.isCodeContainer) return;
+  
+  const code = cell.content || '';
+  const lang = detectCodeLanguage(code);
+  const outputEl = document.getElementById(`codeOutput-${cellId}`);
+  const contentEl = document.getElementById(`codeOutputContent-${cellId}`);
+  const codeEl = document.querySelector(`[data-cell-id="${cellId}"].grip-cell-code-content`);
+  
+  if (!outputEl || !contentEl) return;
+  
+  outputEl.style.display = 'block';
+  contentEl.innerHTML = '<span class="code-running-animation">⏳ Running...</span>';
+  
+  // Clear previous error highlights
+  clearCodeErrorHighlights(cellId);
+  
+  // Run the code first
+  let hasError = false;
+  let runtimeError = null;
+  
+  if (lang === 'JavaScript') {
+    const result = runJavaScript(code, contentEl, outputEl);
+    hasError = result.hasError;
+    runtimeError = result.error;
+  } else if (lang === 'Python') {
+    runPythonSimulated(code, contentEl, outputEl);
+  } else if (lang === 'C++' || lang === 'C') {
+    runCppSimulated(code, contentEl, outputEl);
+  } else {
+    contentEl.textContent = `⚠️ Code execution not supported for ${lang}.\n\nSupported languages: JavaScript, Python, C++`;
+  }
+  
+  // ALWAYS use AI to analyze code for potential issues
+  if (typeof window.analyzeCodeErrors === 'function') {
+    try {
+      // Show analyzing indicator with smooth animation
+      if (hasError) {
+        contentEl.innerHTML += `\n\n<span class="ai-analyzing">
+          <svg class="ai-analyzing-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <path d="M12 6v6l4 2"/>
+          </svg>
+          <span class="ai-analyzing-text">AI analyzing errors</span>
+          <span class="ai-analyzing-dots"><span></span><span></span><span></span></span>
+        </span>`;
+      }
+      
+      const analysis = await window.analyzeCodeErrors(code, lang.toLowerCase());
+      
+      // Remove analyzing indicator
+      const analyzingEl = contentEl.querySelector('.ai-analyzing');
+      if (analyzingEl) analyzingEl.remove();
+      
+      if (analysis.errors && analysis.errors.length > 0) {
+        highlightCodeErrors(cellId, analysis.errors, codeEl);
+        
+        // Add AI insights to output if there were errors
+        if (hasError) {
+          contentEl.innerHTML += `\n\n<div class="ai-error-summary">
+            <div class="ai-error-summary-header">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;">
+                <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+                <line x1="12" y1="9" x2="12" y2="13"/>
+                <line x1="12" y1="17" x2="12.01" y2="17"/>
+              </svg>
+              <strong>AI Found ${analysis.errors.length} issue${analysis.errors.length > 1 ? 's' : ''}</strong>
+            </div>
+            <ul>${analysis.errors.map(e => `<li>Line ${e.line}: ${e.message}</li>`).join('')}</ul>
+            <small>Hover over highlighted lines for fix suggestions</small>
+          </div>`;
+        }
+      }
+    } catch (e) {
+      console.log('AI code analysis unavailable:', e);
+    }
+  }
+}
+
+function clearCodeErrorHighlights(cellId) {
+  const codeEl = document.querySelector(`[data-cell-id="${cellId}"].grip-cell-code-content`);
+  if (codeEl) {
+    // Remove any error tooltips
+    codeEl.querySelectorAll('.code-error-tooltip').forEach(el => el.remove());
+    codeEl.querySelectorAll('.code-error-highlight').forEach(el => {
+      el.classList.remove('code-error-highlight');
+    });
+  }
+}
+
+function highlightCodeErrors(cellId, errors, codeEl) {
+  if (!codeEl || !errors.length) return;
+  
+  const lines = (codeEl.textContent || '').split('\n');
+  let html = '';
+  
+  lines.forEach((line, idx) => {
+    const lineNum = idx + 1;
+    const error = errors.find(e => e.line === lineNum);
+    
+    if (error) {
+      const escapedLine = escapeHtml(line);
+      html += `<span class="code-error-highlight" data-line="${lineNum}">${escapedLine}
+        <div class="code-error-tooltip">
+          <div class="code-error-tooltip-header">
+            <div class="code-error-tooltip-icon">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="12" y1="8" x2="12" y2="12"/>
+                <line x1="12" y1="16" x2="12.01" y2="16"/>
+              </svg>
+            </div>
+            <span class="code-error-tooltip-type">${error.type}</span>
+          </div>
+          <div class="code-error-tooltip-message">${escapeHtml(error.message)}</div>
+          <div class="code-error-tooltip-fix"><strong>Fix:</strong> ${escapeHtml(error.fix)}</div>
+        </div>
+      </span>\n`;
+    } else {
+      html += escapeHtml(line) + '\n';
+    }
+  });
+  
+  codeEl.innerHTML = html;
+}
+
+function runJavaScript(code, contentEl, outputEl) {
+  try {
+    const logs = [];
+    const originalLog = console.log;
+    const originalError = console.error;
+    const originalWarn = console.warn;
+    
+    console.log = (...args) => {
+      logs.push(args.map(arg => typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)).join(' '));
+    };
+    console.error = (...args) => {
+      logs.push('❌ ' + args.map(arg => typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)).join(' '));
+    };
+    console.warn = (...args) => {
+      logs.push('⚠️ ' + args.map(arg => typeof arg === 'object' ? JSON.stringify(arg, null, 2) : String(arg)).join(' '));
+    };
+    
+    const result = eval(code);
+    
+    console.log = originalLog;
+    console.error = originalError;
+    console.warn = originalWarn;
+    
+    let output = logs.join('\n');
+    if (result !== undefined && logs.length === 0) {
+      output = typeof result === 'object' ? JSON.stringify(result, null, 2) : String(result);
+    }
+    
+    contentEl.textContent = output || '✅ Code executed successfully (no output)';
+    outputEl.style.borderColor = '#22c55e';
+    outputEl.style.background = 'rgba(34, 197, 94, 0.1)';
+    return { hasError: false, error: null };
+  } catch (error) {
+    contentEl.textContent = `❌ Error: ${error.message}`;
+    outputEl.style.borderColor = '#ef4444';
+    outputEl.style.background = 'rgba(239, 68, 68, 0.1)';
+    return { hasError: true, error: error };
+  }
+}
+
+function runPythonSimulated(code, outputEl) {
+  // Simple Python simulation for basic operations
+  try {
+    const lines = code.split('\n');
+    const outputs = [];
+    const variables = {};
+    
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      
+      // Handle print statements
+      const printMatch = trimmed.match(/^print\s*\(\s*(.+)\s*\)$/);
+      if (printMatch) {
+        let content = printMatch[1];
+        
+        // Handle string literals
+        if ((content.startsWith('"') && content.endsWith('"')) || 
+            (content.startsWith("'") && content.endsWith("'"))) {
+          outputs.push(content.slice(1, -1));
+        } else if (content.startsWith('f"') || content.startsWith("f'")) {
+          // f-string simulation
+          let fstring = content.slice(2, -1);
+          fstring = fstring.replace(/\{([^}]+)\}/g, (match, varName) => {
+            return variables[varName.trim()] !== undefined ? variables[varName.trim()] : match;
+          });
+          outputs.push(fstring);
+        } else {
+          // Try to evaluate expression
+          const val = variables[content] !== undefined ? variables[content] : evalSimplePythonExpr(content, variables);
+          outputs.push(String(val));
+        }
+        continue;
+      }
+      
+      // Handle variable assignment
+      const assignMatch = trimmed.match(/^(\w+)\s*=\s*(.+)$/);
+      if (assignMatch) {
+        const [, varName, value] = assignMatch;
+        variables[varName] = evalSimplePythonExpr(value, variables);
+        continue;
+      }
+    }
+    
+    outputEl.textContent = outputs.length > 0 
+      ? outputs.join('\n') 
+      : '✓ Python code simulated (no print output)\n⚠️ Note: This is a simplified simulation. Complex Python features may not work.';
+  } catch (error) {
+    outputEl.textContent = `❌ Simulation Error: ${error.message}\n⚠️ Note: This is a simplified Python simulation.`;
+  }
+}
+
+function evalSimplePythonExpr(expr, variables) {
+  expr = expr.trim();
+  
+  // String literals
+  if ((expr.startsWith('"') && expr.endsWith('"')) || (expr.startsWith("'") && expr.endsWith("'"))) {
+    return expr.slice(1, -1);
+  }
+  
+  // Numbers
+  if (!isNaN(Number(expr))) {
+    return Number(expr);
+  }
+  
+  // Variable reference
+  if (variables[expr] !== undefined) {
+    return variables[expr];
+  }
+  
+  // Simple arithmetic
+  try {
+    const sanitized = expr.replace(/\b(\w+)\b/g, (match) => {
+      return variables[match] !== undefined ? variables[match] : match;
+    });
+    return eval(sanitized);
+  } catch (e) {
+    return expr;
+  }
+}
+
+function runCppSimulated(code, outputEl) {
+  // Very basic C++ output simulation
+  try {
+    const outputs = [];
+    const lines = code.split('\n');
+    
+    for (const line of lines) {
+      // Handle cout statements
+      const coutMatch = line.match(/cout\s*<<\s*(.+?)\s*(?:<<\s*endl)?;/);
+      if (coutMatch) {
+        let content = coutMatch[1];
+        // Handle multiple << operators
+        const parts = content.split('<<').map(p => p.trim());
+        const output = parts.map(part => {
+          if ((part.startsWith('"') && part.endsWith('"')) || (part.startsWith("'") && part.endsWith("'"))) {
+            return part.slice(1, -1);
+          }
+          if (part === 'endl') return '';
+          return part;
+        }).join('');
+        if (output) outputs.push(output);
+      }
+      
+      // Handle printf
+      const printfMatch = line.match(/printf\s*\(\s*"([^"]+)".*\)/);
+      if (printfMatch) {
+        outputs.push(printfMatch[1].replace(/\\n/g, '\n'));
+      }
+    }
+    
+    outputEl.textContent = outputs.length > 0 
+      ? outputs.join('\n') 
+      : '✓ C++ code parsed (no cout/printf output detected)\n⚠️ Note: This is a simplified simulation. Actual compilation requires a C++ compiler.';
+  } catch (error) {
+    outputEl.textContent = `❌ Simulation Error: ${error.message}\n⚠️ Note: This is a simplified C++ simulation.`;
+  }
+}
+
+function hideCodeOutput(cellId) {
+  const outputEl = document.getElementById(`codeOutput-${cellId}`);
+  if (outputEl) {
+    outputEl.style.display = 'none';
+  }
+}
+
 
 function updateGripCellComment(cellId, comment) {
   const cellIndex = gripCells.findIndex(c => c.id === cellId);
@@ -2364,7 +3309,8 @@ function toggleGripConnectMode() {
   gripConnectMode = !gripConnectMode;
   gripConnectFromId = null;
   gripConnectFromPosition = null;
-  renderGripDiagramOverlay();
+  updateToolbarState();
+  updateGripUI();
 }
 
 function createGripConnection(fromId, fromPosition, toId, toPosition) {
@@ -2389,6 +3335,10 @@ function createGripConnection(fromId, fromPosition, toId, toPosition) {
 // Make functions globally available
 window.openGripDiagram = openGripDiagram;
 window.closeGripDiagram = closeGripDiagram;
+window.runCode = runCode;
+window.hideCodeOutput = hideCodeOutput;
+window.updateCodeCellContent = updateCodeCellContent;
+window.updateCodeLanguageDisplay = updateCodeLanguageDisplay;
 
 // ============================================
 // AI Chat Assistant Functions
@@ -2398,6 +3348,7 @@ let aiChatMessages = [];
 function setupAiChatListeners() {
   const toggleBtn = document.getElementById('gripAiChatToggle');
   const closeBtn = document.getElementById('gripAiChatClose');
+  const backdrop = document.getElementById('gripAiChatBackdrop');
   const sendBtn = document.getElementById('gripAiSend');
   const input = document.getElementById('gripAiInput');
   
@@ -2406,10 +3357,11 @@ function setupAiChatListeners() {
   }
   
   if (closeBtn) {
-    closeBtn.addEventListener('click', () => {
-      const chat = document.getElementById('gripAiChat');
-      if (chat) chat.style.display = 'none';
-    });
+    closeBtn.addEventListener('click', closeAiChat);
+  }
+  
+  if (backdrop) {
+    backdrop.addEventListener('click', closeAiChat);
   }
   
   if (sendBtn) {
@@ -2425,12 +3377,36 @@ function setupAiChatListeners() {
 
 function toggleAiChat() {
   const chat = document.getElementById('gripAiChat');
+  const backdrop = document.getElementById('gripAiChatBackdrop');
   if (chat) {
-    chat.style.display = chat.style.display === 'none' ? 'flex' : 'none';
+    const isOpen = chat.classList.contains('open');
+    if (isOpen) {
+      closeAiChat();
+    } else {
+      chat.classList.add('open');
+      if (backdrop) backdrop.classList.add('open');
+      // Focus input
+      const input = document.getElementById('gripAiInput');
+      if (input) setTimeout(() => input.focus(), 100);
+    }
   }
 }
 
+function closeAiChat() {
+  const chat = document.getElementById('gripAiChat');
+  const backdrop = document.getElementById('gripAiChatBackdrop');
+  if (chat) chat.classList.remove('open');
+  if (backdrop) backdrop.classList.remove('open');
+}
+
 function handleAiSend() {
+  // Use Gemini-powered handler if available
+  if (typeof window.handleWhiteboardAiSendWithGemini === 'function') {
+    window.handleWhiteboardAiSendWithGemini();
+    return;
+  }
+  
+  // Fallback to simulated response
   const input = document.getElementById('gripAiInput');
   const messagesContainer = document.getElementById('gripAiMessages');
   
@@ -2438,6 +3414,10 @@ function handleAiSend() {
   
   const message = input.value.trim();
   if (!message) return;
+  
+  // Clear welcome message if exists
+  const welcomeMsg = messagesContainer.querySelector('.grip-ai-welcome');
+  if (welcomeMsg) welcomeMsg.remove();
   
   // Add user message
   const userMsg = document.createElement('div');
@@ -2450,12 +3430,17 @@ function handleAiSend() {
   // Scroll to bottom
   messagesContainer.scrollTop = messagesContainer.scrollHeight;
   
-  // Show typing indicator
-  const typingMsg = document.createElement('div');
-  typingMsg.className = 'grip-ai-message assistant typing';
-  typingMsg.id = 'aiTyping';
-  typingMsg.innerHTML = '<span></span><span></span><span></span>';
-  messagesContainer.appendChild(typingMsg);
+  // Show looping AI loading indicator
+  const loadingMsg = document.createElement('div');
+  loadingMsg.className = 'grip-ai-loading-loop';
+  loadingMsg.id = 'aiTyping';
+  loadingMsg.innerHTML = `
+    <div class="grip-ai-loading-dots-loop">
+      <span></span><span></span><span></span>
+    </div>
+    <span class="grip-ai-loading-text-loop">Thinking...</span>
+  `;
+  messagesContainer.appendChild(loadingMsg);
   messagesContainer.scrollTop = messagesContainer.scrollHeight;
   
   // Simulate AI response after delay
@@ -2568,13 +3553,15 @@ function generateAiResponse(userMessage) {
 // ============================================
 
 function setupToolsListeners() {
-  // Bottom toolbar tools (new ClickUp style)
+  // Bottom toolbar tools (new ClickUp style) - Use updateGripUI to prevent scroll reset
   const toolbarTools = document.querySelectorAll('.toolbar-tool[data-tool]');
   toolbarTools.forEach(btn => {
     btn.addEventListener('click', () => {
       gripActiveTool = btn.dataset.tool;
       gripSelectedTextBoxId = null;
-      renderGripDiagramOverlay();
+      // Use updateGripUI instead of full re-render to preserve scroll
+      updateToolbarState();
+      updateGripUI();
     });
   });
   
@@ -2584,7 +3571,9 @@ function setupToolsListeners() {
     btn.addEventListener('click', () => {
       gripActiveTool = btn.dataset.tool;
       gripSelectedTextBoxId = null;
-      renderGripDiagramOverlay();
+      // Use updateGripUI instead of full re-render to preserve scroll
+      updateToolbarState();
+      updateGripUI();
     });
   });
   
