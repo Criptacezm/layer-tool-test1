@@ -1,497 +1,792 @@
-// db-api.js
-// This is the database API script that interacts with the PostgreSQL database.
-// It uses the 'pg' module for Node.js to connect and query the DB.
-// Assumptions:
-// - This is a Node.js module; the app needs a backend/server to use it (e.g., Express or Vercel serverless).
-// - Connection details: Use environment variables for security (e.g., process.env.DATABASE_URL).
-// - All functions are async and return Promises.
-// - Error handling: Throws errors for failures; callers should catch.
-// - Uses Pool for connection management.
-// - For production: Add transactions where needed (e.g., addProject with columns).
-// - Note: For browser integration, store.js will need to use fetch to call API endpoints wrapping these functions.
+/* ============================================
+   Layer - Supabase Database API (Browser Client)
+   ============================================ */
 
-const { Pool } = require('pg');
+// Supabase Configuration - Your personal project
+const SUPABASE_URL = 'https://uqfnadlyrbprzxgjkvtc.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVxZm5hZGx5cmJwcnp4Z2prdnRjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjczNzkxNzAsImV4cCI6MjA4Mjk1NTE3MH0.12PfMd0vnsWvCXSNdkc3E02KDn46xi9XTyZ8rXNiVHs';
 
-// Database connection pool
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL, // e.g., 'postgresql://user:pass@localhost:5432/dbname'
-  ssl: { rejectUnauthorized: false } // For production, configure properly
+// Initialize Supabase client
+let supabase = null;
+let currentUser = null;
+let currentSession = null;
+
+function initSupabase() {
+  if (typeof window !== 'undefined' && window.supabase) {
+    supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    console.log('Supabase initialized successfully');
+    return supabase;
+  }
+  console.warn('Supabase library not loaded');
+  return null;
+}
+
+// Initialize on load
+document.addEventListener('DOMContentLoaded', () => {
+  initSupabase();
+  setupAuthListener();
 });
 
-// Helper: Execute query with params
-async function query(text, params) {
-  const client = await pool.connect();
-  try {
-    return await client.query(text, params);
-  } finally {
-    client.release();
+// Setup auth state listener
+function setupAuthListener() {
+  if (!supabase) {
+    setTimeout(setupAuthListener, 100);
+    return;
   }
-}
-
-// Load all projects
-async function loadProjects() {
-  const res = await query('SELECT * FROM projects ORDER BY created_at DESC', []);
-  return res.rows;
-}
-
-// Save projects (bulk upsert; but since it's array, assume replace all - not efficient, use for migration)
-async function saveProjects(projects) {
-  // For production, better to use individual upserts, but to match localStorage, truncate and insert
-  await query('TRUNCATE projects CASCADE', []); // Caution: Deletes all!
-  for (const proj of projects) {
-    await addProject(proj); // Use add to handle nested
-  }
-}
-
-// Add a single project (and its nested columns/tasks/updates/flowchart)
-async function addProject(projectData) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
+  
+  supabase.auth.onAuthStateChange((event, session) => {
+    console.log('Auth state changed:', event);
+    currentSession = session;
+    currentUser = session?.user ?? null;
     
-    // Insert project
-    const projRes = await client.query(
-      `INSERT INTO projects (id, name, status, start_date, target_date, description, user_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [projectData.id || uuid.v4(), projectData.name, projectData.status, projectData.startDate, projectData.targetDate, projectData.description, projectData.user_id || null]
-    );
-    const projId = projRes.rows[0].id;
-
-    // Insert columns
-    for (let pos = 0; pos < projectData.columns.length; pos++) {
-      const col = projectData.columns[pos];
-      const colRes = await client.query(
-        `INSERT INTO project_columns (project_id, title, position)
-         VALUES ($1, $2, $3) RETURNING id`,
-        [projId, col.title, pos]
-      );
-      const colId = colRes.rows[0].id;
-
-      // Insert tasks
-      for (const task of col.tasks || []) {
-        await client.query(
-          `INSERT INTO tasks (column_id, title, done, created_at)
-           VALUES ($1, $2, $3, $4)`,
-          [colId, task.title, task.done, task.createdAt || new Date()]
-        );
+    // Update UI based on auth state
+    updateAuthUI();
+    
+    if (event === 'SIGNED_IN') {
+      closeModal();
+      if (typeof renderCurrentView === 'function') {
+        renderCurrentView();
+      }
+    } else if (event === 'SIGNED_OUT') {
+      if (typeof renderCurrentView === 'function') {
+        renderCurrentView();
       }
     }
+  });
+  
+  // Check for existing session
+  supabase.auth.getSession().then(({ data: { session } }) => {
+    currentSession = session;
+    currentUser = session?.user ?? null;
+    updateAuthUI();
+  });
+}
 
-    // Insert updates
-    for (const update of projectData.updates || []) {
-      await client.query(
-        `INSERT INTO project_updates (project_id, actor_id, message, time)
-         VALUES ($1, $2, $3, $4)`,
-        [projId, update.actor_id || null, update.message || update.action, update.time || new Date()]
-      );
+// Update UI based on auth state
+function updateAuthUI() {
+  const signInBtn = document.getElementById('signInBtn');
+  if (signInBtn) {
+    if (currentUser) {
+      signInBtn.innerHTML = `
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+          <polyline points="16 17 21 12 16 7"/>
+          <line x1="21" y1="12" x2="9" y2="12"/>
+        </svg>
+        <span>Sign Out</span>
+      `;
+      signInBtn.onclick = handleSignOut;
+    } else {
+      signInBtn.innerHTML = `
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+          <polyline points="10 17 15 12 10 7"/>
+          <line x1="15" y1="12" x2="3" y2="12"/>
+        </svg>
+        <span>Sign In</span>
+      `;
+      signInBtn.onclick = openAuthModal;
     }
-
-    // Insert flowchart nodes and connections
-    for (const node of projectData.flowchart?.nodes || []) {
-      const nodeRes = await client.query(
-        `INSERT INTO flowchart_nodes (project_id, type, position, data)
-         VALUES ($1, $2, $3, $4) RETURNING id`,
-        [projId, node.type, node.position, node.data]
-      );
-      // Edges would need mapping, assume projectData.flowchart.edges have source/target ids
-      // For simplicity, skip if not present; add logic if needed
-    }
-    for (const conn of projectData.flowchart?.edges || []) {
-      await client.query(
-        `INSERT INTO flowchart_connections (project_id, from_node_id, from_position, to_node_id, to_position)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [projId, conn.from_node_id, conn.from_position, conn.to_node_id, conn.to_position]
-      );
-    }
-
-    await client.query('COMMIT');
-    return projId;
-  } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-  } finally {
-    client.release();
   }
 }
 
-// Update project
-async function updateProject(projectId, updates) {
-  // Partial update
-  const setClauses = [];
-  const params = [];
-  let paramIdx = 1;
+// Get current user (sync - returns cached value)
+function getCurrentUser() {
+  return currentUser;
+}
 
-  for (const [key, value] of Object.entries(updates)) {
-    if (key === 'id') continue; // Can't update ID
-    setClauses.push(`${key} = $${paramIdx++}`);
-    params.push(value);
+// Get current session (sync - returns cached value)
+function getSession() {
+  return currentSession;
+}
+
+// Check if user is authenticated
+function isAuthenticated() {
+  return !!currentUser;
+}
+
+// ============================================
+// Authentication UI
+// ============================================
+function openAuthModal() {
+  const content = `
+    <div class="auth-container">
+      <div class="auth-tabs">
+        <button class="auth-tab active" onclick="switchAuthTab('login')">Sign In</button>
+        <button class="auth-tab" onclick="switchAuthTab('signup')">Sign Up</button>
+      </div>
+      
+      <form id="authForm" onsubmit="handleAuthSubmit(event)">
+        <div id="authError" class="auth-error" style="display: none;"></div>
+        
+        <div class="form-group">
+          <label class="form-label">Email</label>
+          <input type="email" name="email" class="form-input" required placeholder="you@example.com" autocomplete="email">
+        </div>
+        
+        <div class="form-group">
+          <label class="form-label">Password</label>
+          <input type="password" name="password" class="form-input" required placeholder="••••••••" minlength="6" autocomplete="current-password">
+        </div>
+        
+        <input type="hidden" name="authMode" id="authMode" value="login">
+        
+        <div class="form-actions" style="margin-top: 24px;">
+          <button type="submit" class="btn btn-primary" id="authSubmitBtn" style="width: 100%;">
+            Sign In
+          </button>
+        </div>
+      </form>
+      
+      <p class="auth-footer" style="text-align: center; margin-top: 16px; color: var(--muted-foreground); font-size: 13px;">
+        Your data will be saved to your personal account.
+      </p>
+    </div>
+  `;
+  openModal('Welcome to Layer', content);
+}
+
+function switchAuthTab(mode) {
+  const tabs = document.querySelectorAll('.auth-tab');
+  tabs.forEach(tab => tab.classList.remove('active'));
+  
+  if (mode === 'login') {
+    tabs[0].classList.add('active');
+    document.getElementById('authMode').value = 'login';
+    document.getElementById('authSubmitBtn').textContent = 'Sign In';
+  } else {
+    tabs[1].classList.add('active');
+    document.getElementById('authMode').value = 'signup';
+    document.getElementById('authSubmitBtn').textContent = 'Create Account';
   }
-
-  params.push(projectId);
-  await query(
-    `UPDATE projects SET ${setClauses.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${paramIdx}`,
-    params
-  );
+  
+  // Clear error
+  document.getElementById('authError').style.display = 'none';
 }
 
-// Delete project
-async function deleteProject(projectId) {
-  await query('DELETE FROM projects WHERE id = $1', [projectId]); // CASCADE handles children
-}
-
-// Add task to column
-async function addTaskToColumn(projectId, columnIndex, title) {
-  // First, find column by project and position (assuming position = index)
-  const colRes = await query(
-    'SELECT id FROM project_columns WHERE project_id = $1 AND position = $2',
-    [projectId, columnIndex]
-  );
-  if (colRes.rows.length === 0) throw new Error('Column not found');
-  const colId = colRes.rows[0].id;
-
-  await query(
-    'INSERT INTO tasks (column_id, title) VALUES ($1, $2)',
-    [colId, title]
-  );
-}
-
-// Toggle task done
-async function toggleTaskDone(taskId) {
-  await query(
-    'UPDATE tasks SET done = NOT done, updated_at = CURRENT_TIMESTAMP WHERE id = $1',
-    [taskId]
-  );
-}
-
-// Delete task
-async function deleteTask(taskId) {
-  await query('DELETE FROM tasks WHERE id = $1', [taskId]);
-}
-
-// Similar functions for other entities...
-// Load backlog tasks
-async function loadBacklogTasks() {
-  const res = await query('SELECT * FROM backlog_tasks ORDER BY created_at DESC', []);
-  return res.rows;
-}
-
-// Add backlog task
-async function addBacklogTask(taskData) {
-  const res = await query(
-    `INSERT INTO backlog_tasks (title, status, priority, assignee_id, due_date)
-     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-    [taskData.title, taskData.status, taskData.priority, taskData.assignee_id || null, taskData.dueDate]
-  );
-  return res.rows[0];
-}
-
-// Update backlog task
-async function updateBacklogTask(taskId, updates) {
-  // Similar to updateProject
-  const setClauses = [];
-  const params = [];
-  let paramIdx = 1;
-
-  for (const [key, value] of Object.entries(updates)) {
-    setClauses.push(`${key} = $${paramIdx++}`);
-    params.push(value);
+async function handleAuthSubmit(event) {
+  event.preventDefault();
+  
+  const form = event.target;
+  const email = form.email.value.trim();
+  const password = form.password.value;
+  const mode = form.authMode.value;
+  const submitBtn = document.getElementById('authSubmitBtn');
+  const errorDiv = document.getElementById('authError');
+  
+  // Basic validation
+  if (!email || !password) {
+    showAuthError('Please fill in all fields');
+    return;
   }
-
-  params.push(taskId);
-  await query(
-    `UPDATE backlog_tasks SET ${setClauses.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${paramIdx}`,
-    params
-  );
-}
-
-// Delete backlog task
-async function deleteBacklogTask(taskId) {
-  await query('DELETE FROM backlog_tasks WHERE id = $1', [taskId]);
-}
-
-// Load issues
-async function loadIssues() {
-  const res = await query('SELECT * FROM issues ORDER BY created_at DESC', []);
-  return res.rows;
-}
-
-// Add issue
-async function addIssue(issueData) {
-  const res = await query(
-    `INSERT INTO issues (id, title, status, priority, assignee_id, reporter_id, description)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
-    [issueData.id, issueData.title, issueData.status, issueData.priority, issueData.assignee_id || null, issueData.reporter_id || null, issueData.description]
-  );
-  return res.rows[0];
-}
-
-// Update issue
-async function updateIssue(issueId, updates) {
-  // Similar update logic
-  const setClauses = [];
-  const params = [];
-  let paramIdx = 1;
-
-  for (const [key, value] of Object.entries(updates)) {
-    if (key === 'id') continue;
-    setClauses.push(`${key} = $${paramIdx++}`);
-    params.push(value);
+  
+  if (password.length < 6) {
+    showAuthError('Password must be at least 6 characters');
+    return;
   }
-
-  params.push(issueId);
-  await query(
-    `UPDATE issues SET ${setClauses.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${paramIdx}`,
-    params
-  );
-}
-
-// Delete issue
-async function deleteIssue(issueId) {
-  await query('DELETE FROM issues WHERE id = $1', [issueId]);
-}
-
-// Load calendar events
-async function loadCalendarEvents() {
-  const res = await query('SELECT * FROM calendar_events ORDER BY date ASC', []);
-  return res.rows;
-}
-
-// Add calendar event
-async function addCalendarEvent(eventData) {
-  const res = await query(
-    `INSERT INTO calendar_events (title, date, time, description)
-     VALUES ($1, $2, $3, $4) RETURNING *`,
-    [eventData.title, eventData.date, eventData.time, eventData.description]
-  );
-  return res.rows[0];
-}
-
-// Toggle event completed
-async function toggleEventCompleted(eventId) {
-  await query(
-    'UPDATE calendar_events SET completed = NOT completed, updated_at = CURRENT_TIMESTAMP WHERE id = $1',
-    [eventId]
-  );
-}
-
-// Delete calendar event
-async function deleteCalendarEvent(eventId) {
-  await query('DELETE FROM calendar_events WHERE id = $1', [eventId]);
-}
-
-// Load docs
-async function loadDocs() {
-  const res = await query('SELECT * FROM documents ORDER BY updated_at DESC', []);
-  return res.rows;
-}
-
-// Save doc
-async function saveDoc(docId, content) {
-  await query(
-    'UPDATE documents SET content = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2',
-    [content, docId]
-  );
-}
-
-// Add doc
-async function addDoc(docData) {
-  const res = await query(
-    `INSERT INTO documents (title, content) VALUES ($1, $2) RETURNING *`,
-    [docData.title, docData.content || '']
-  );
-  return res.rows[0];
-}
-
-// Delete doc
-async function deleteDoc(docId) {
-  await query('DELETE FROM documents WHERE id = $1', [docId]);
-}
-
-// Load excels
-async function loadExcels() {
-  const res = await query('SELECT * FROM excels ORDER BY updated_at DESC', []);
-  return res.rows;
-}
-
-// Add excel
-async function addExcel(excelData) {
-  const client = await pool.connect();
+  
+  // Show loading state
+  submitBtn.disabled = true;
+  submitBtn.innerHTML = '<span class="spinner"></span> Please wait...';
+  errorDiv.style.display = 'none';
+  
   try {
-    await client.query('BEGIN');
+    if (!supabase) initSupabase();
     
-    const excelRes = await client.query(
-      `INSERT INTO excels (title) VALUES ($1) RETURNING id`,
-      [excelData.title]
-    );
-    const excelId = excelRes.rows[0].id;
-
-    // Insert sheets
-    for (const sheet of excelData.sheets || []) {
-      await client.query(
-        `INSERT INTO excel_sheets (excel_id, name, grid_data)
-         VALUES ($1, $2, $3)`,
-        [excelId, sheet.name, sheet.rows || []] // JSONB
-      );
+    let result;
+    if (mode === 'signup') {
+      result = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          emailRedirectTo: window.location.origin + '/layer.html'
+        }
+      });
+    } else {
+      result = await supabase.auth.signInWithPassword({
+        email,
+        password
+      });
     }
+    
+    if (result.error) {
+      throw result.error;
+    }
+    
+    if (mode === 'signup' && result.data?.user && !result.data.session) {
+      // Email confirmation required
+      showAuthSuccess('Check your email for a confirmation link!');
+      submitBtn.disabled = false;
+      submitBtn.textContent = mode === 'login' ? 'Sign In' : 'Create Account';
+    }
+    // Success - auth listener will handle the rest
+    
+  } catch (error) {
+    console.error('Auth error:', error);
+    let message = error.message || 'Authentication failed';
+    
+    // Friendly error messages
+    if (message.includes('Invalid login credentials')) {
+      message = 'Invalid email or password';
+    } else if (message.includes('User already registered')) {
+      message = 'This email is already registered. Try signing in.';
+    } else if (message.includes('Email not confirmed')) {
+      message = 'Please check your email to confirm your account.';
+    }
+    
+    showAuthError(message);
+    submitBtn.disabled = false;
+    submitBtn.textContent = mode === 'login' ? 'Sign In' : 'Create Account';
+  }
+}
 
-    await client.query('COMMIT');
-    return excelId;
+function showAuthError(message) {
+  const errorDiv = document.getElementById('authError');
+  if (errorDiv) {
+    errorDiv.textContent = message;
+    errorDiv.style.display = 'block';
+    errorDiv.style.color = '#ef4444';
+    errorDiv.style.background = 'rgba(239, 68, 68, 0.1)';
+    errorDiv.style.padding = '12px';
+    errorDiv.style.borderRadius = '8px';
+    errorDiv.style.marginBottom = '16px';
+  }
+}
+
+function showAuthSuccess(message) {
+  const errorDiv = document.getElementById('authError');
+  if (errorDiv) {
+    errorDiv.textContent = message;
+    errorDiv.style.display = 'block';
+    errorDiv.style.color = '#22c55e';
+    errorDiv.style.background = 'rgba(34, 197, 94, 0.1)';
+    errorDiv.style.padding = '12px';
+    errorDiv.style.borderRadius = '8px';
+    errorDiv.style.marginBottom = '16px';
+  }
+}
+
+async function handleSignOut() {
+  if (!supabase) initSupabase();
+  
+  try {
+    await supabase.auth.signOut();
+    currentUser = null;
+    currentSession = null;
+    updateAuthUI();
+  } catch (error) {
+    console.error('Sign out error:', error);
+  }
+}
+
+// ============================================
+// Database Operations (with localStorage fallback)
+// ============================================
+
+// Helper to check if we should use Supabase
+function useSupabase() {
+  return supabase && currentUser;
+}
+
+// ============================================
+// Projects CRUD
+// ============================================
+async function dbLoadProjects() {
+  if (!useSupabase()) {
+    // Fallback to localStorage
+    return loadProjectsLocal();
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('projects')
+      .select('*')
+      .eq('user_id', currentUser.id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    return (data || []).map(project => ({
+      id: project.id,
+      name: project.name,
+      description: project.description || '',
+      status: project.status || 'todo',
+      startDate: project.start_date,
+      targetDate: project.target_date,
+      flowchart: project.flowchart || { nodes: [], edges: [] },
+      columns: project.columns || [
+        { title: 'To Do', tasks: [] },
+        { title: 'In Progress', tasks: [] },
+        { title: 'Done', tasks: [] },
+      ],
+      updates: project.updates || [],
+      createdAt: project.created_at
+    }));
+  } catch (error) {
+    console.error('Error loading projects:', error);
+    return loadProjectsLocal();
+  }
+}
+
+async function dbAddProject(projectData) {
+  if (!useSupabase()) {
+    return addProjectLocal(projectData);
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('projects')
+      .insert({
+        user_id: currentUser.id,
+        name: projectData.name,
+        description: projectData.description || '',
+        status: projectData.status || 'todo',
+        start_date: projectData.startDate || new Date().toISOString().split('T')[0],
+        target_date: projectData.targetDate || null,
+        flowchart: projectData.flowchart || { nodes: [], edges: [] },
+        columns: projectData.columns || [
+          { title: 'To Do', tasks: [] },
+          { title: 'In Progress', tasks: [] },
+          { title: 'Done', tasks: [] },
+        ],
+        updates: [{ actor: 'You', action: 'Project created', time: 'just now' }]
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('Error adding project:', error);
+    return addProjectLocal(projectData);
+  }
+}
+
+async function dbUpdateProject(projectId, updates) {
+  if (!useSupabase()) {
+    return updateProjectLocal(projectId, updates);
+  }
+
+  try {
+    const dbUpdates = {};
+    if (updates.name !== undefined) dbUpdates.name = updates.name;
+    if (updates.description !== undefined) dbUpdates.description = updates.description;
+    if (updates.status !== undefined) dbUpdates.status = updates.status;
+    if (updates.startDate !== undefined) dbUpdates.start_date = updates.startDate;
+    if (updates.targetDate !== undefined) dbUpdates.target_date = updates.targetDate;
+    if (updates.flowchart !== undefined) dbUpdates.flowchart = updates.flowchart;
+    if (updates.columns !== undefined) dbUpdates.columns = updates.columns;
+    if (updates.updates !== undefined) dbUpdates.updates = updates.updates;
+
+    const { data, error } = await supabase
+      .from('projects')
+      .update(dbUpdates)
+      .eq('id', projectId)
+      .eq('user_id', currentUser.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('Error updating project:', error);
+    return null;
+  }
+}
+
+async function dbDeleteProject(projectId) {
+  if (!useSupabase()) {
+    return deleteProjectLocal(projectId);
+  }
+
+  try {
+    const { error } = await supabase
+      .from('projects')
+      .delete()
+      .eq('id', projectId)
+      .eq('user_id', currentUser.id);
+
+    if (error) throw error;
+    return true;
+  } catch (error) {
+    console.error('Error deleting project:', error);
+    return false;
+  }
+}
+
+// ============================================
+// Backlog Tasks CRUD
+// ============================================
+async function dbLoadBacklogTasks() {
+  if (!useSupabase()) {
+    return loadBacklogTasksLocal();
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('backlog_tasks')
+      .select('*')
+      .eq('user_id', currentUser.id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    return data || [];
+  } catch (error) {
+    console.error('Error loading backlog tasks:', error);
+    return loadBacklogTasksLocal();
+  }
+}
+
+async function dbAddBacklogTask(title) {
+  if (!useSupabase()) {
+    return addBacklogTaskLocal(title);
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('backlog_tasks')
+      .insert({
+        user_id: currentUser.id,
+        title: title,
+        done: false
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('Error adding backlog task:', error);
+    return addBacklogTaskLocal(title);
+  }
+}
+
+async function dbToggleBacklogTask(taskId, done) {
+  if (!useSupabase()) {
+    return toggleBacklogTaskLocal(taskId);
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('backlog_tasks')
+      .update({ done })
+      .eq('id', taskId)
+      .eq('user_id', currentUser.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('Error toggling backlog task:', error);
+    return null;
+  }
+}
+
+async function dbDeleteBacklogTask(taskId) {
+  if (!useSupabase()) {
+    return deleteBacklogTaskLocal(taskId);
+  }
+
+  try {
+    const { error } = await supabase
+      .from('backlog_tasks')
+      .delete()
+      .eq('id', taskId)
+      .eq('user_id', currentUser.id);
+
+    if (error) throw error;
+    return true;
+  } catch (error) {
+    console.error('Error deleting backlog task:', error);
+    return false;
+  }
+}
+
+// ============================================
+// Issues CRUD
+// ============================================
+async function dbLoadIssues() {
+  if (!useSupabase()) {
+    return loadIssuesLocal();
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('issues')
+      .select('*')
+      .eq('user_id', currentUser.id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    return data || [];
+  } catch (error) {
+    console.error('Error loading issues:', error);
+    return loadIssuesLocal();
+  }
+}
+
+async function dbAddIssue(issueData) {
+  if (!useSupabase()) {
+    return addIssueLocal(issueData);
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('issues')
+      .insert({
+        user_id: currentUser.id,
+        title: issueData.title,
+        description: issueData.description || '',
+        status: issueData.status || 'todo',
+        priority: issueData.priority || 'medium',
+        assignee: issueData.assignee || '',
+        due_date: issueData.dueDate || null
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('Error adding issue:', error);
+    return addIssueLocal(issueData);
+  }
+}
+
+// ============================================
+// Assignments CRUD
+// ============================================
+async function dbLoadAssignments() {
+  if (!useSupabase()) {
+    return loadAssignmentsLocal();
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('assignments')
+      .select('*')
+      .eq('user_id', currentUser.id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    return data || [];
+  } catch (error) {
+    console.error('Error loading assignments:', error);
+    return loadAssignmentsLocal();
+  }
+}
+
+async function dbAddAssignment(assignmentData) {
+  if (!useSupabase()) {
+    return addAssignmentLocal(assignmentData);
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('assignments')
+      .insert({
+        user_id: currentUser.id,
+        title: assignmentData.title,
+        notes: assignmentData.notes || '',
+        files: assignmentData.files || []
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
+    return data;
+  } catch (error) {
+    console.error('Error adding assignment:', error);
+    return addAssignmentLocal(assignmentData);
+  }
+}
+
+async function dbDeleteAssignment(assignmentId) {
+  if (!useSupabase()) {
+    return deleteAssignmentLocal(assignmentId);
+  }
+
+  try {
+    const { error } = await supabase
+      .from('assignments')
+      .delete()
+      .eq('id', assignmentId)
+      .eq('user_id', currentUser.id);
+
+    if (error) throw error;
+    return true;
+  } catch (error) {
+    console.error('Error deleting assignment:', error);
+    return false;
+  }
+}
+
+// ============================================
+// Local Storage Functions (Fallback)
+// ============================================
+function loadProjectsLocal() {
+  try {
+    const data = localStorage.getItem('layerProjectsData');
+    return data ? JSON.parse(data) : [];
   } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-  } finally {
-    client.release();
+    return [];
   }
 }
 
-// Save excel grid
-async function saveExcelGrid(excelId, sheetIndex, grid) {
-  // Find sheet by excel and assume name or position; for simplicity, assume one sheet or query
-  const sheetRes = await query(
-    'SELECT id FROM excel_sheets WHERE excel_id = $1 ORDER BY created_at LIMIT 1 OFFSET $2',
-    [excelId, sheetIndex]
-  );
-  if (sheetRes.rows.length === 0) throw new Error('Sheet not found');
-  const sheetId = sheetRes.rows[0].id;
-
-  await query(
-    'UPDATE excel_sheets SET grid_data = $1 WHERE id = $2',
-    [grid, sheetId]
-  );
+function addProjectLocal(projectData) {
+  const projects = loadProjectsLocal();
+  const newProject = {
+    id: 'PROJ-' + Date.now(),
+    name: projectData.name,
+    status: projectData.status || 'todo',
+    startDate: projectData.startDate || new Date().toISOString().split('T')[0],
+    targetDate: projectData.targetDate,
+    description: projectData.description || '',
+    columns: [
+      { title: 'To Do', tasks: [] },
+      { title: 'In Progress', tasks: [] },
+      { title: 'Done', tasks: [] },
+    ],
+    updates: [{ actor: 'You', action: 'Project created', time: 'just now' }]
+  };
+  projects.push(newProject);
+  localStorage.setItem('layerProjectsData', JSON.stringify(projects));
+  return newProject;
 }
 
-// Delete excel
-async function deleteExcel(excelId) {
-  await query('DELETE FROM excels WHERE id = $1', [excelId]);
-}
-
-// Load assignments
-async function loadAssignments() {
-  const res = await query('SELECT * FROM assignments ORDER BY due_date ASC', []);
-  return res.rows;
-}
-
-// Add assignment
-async function addAssignment(assignData) {
-  const res = await query(
-    `INSERT INTO assignments (title, status, priority, assignee_id, due_date)
-     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-    [assignData.title, assignData.status, assignData.priority, assignData.assignee_id || null, assignData.dueDate]
-  );
-  return res.rows[0];
-}
-
-// Update assignment
-async function updateAssignment(assignId, updates) {
-  // Similar update
-  const setClauses = [];
-  const params = [];
-  let paramIdx = 1;
-
-  for (const [key, value] of Object.entries(updates)) {
-    setClauses.push(`${key} = $${paramIdx++}`);
-    params.push(value);
+function updateProjectLocal(index, updates) {
+  const projects = loadProjectsLocal();
+  if (projects[index]) {
+    projects[index] = { ...projects[index], ...updates };
+    localStorage.setItem('layerProjectsData', JSON.stringify(projects));
   }
-
-  params.push(assignId);
-  await query(
-    `UPDATE assignments SET ${setClauses.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = $${paramIdx}`,
-    params
-  );
+  return projects;
 }
 
-// Delete assignment
-async function deleteAssignment(assignId) {
-  await query('DELETE FROM assignments WHERE id = $1', [assignId]);
+function deleteProjectLocal(index) {
+  const projects = loadProjectsLocal();
+  projects.splice(index, 1);
+  localStorage.setItem('layerProjectsData', JSON.stringify(projects));
+  return projects;
 }
 
-// Add project update
-async function addProjectUpdate(projectId, message, actorId = null) {
-  await query(
-    'INSERT INTO project_updates (project_id, actor_id, message) VALUES ($1, $2, $3)',
-    [projectId, actorId, message]
-  );
+function loadBacklogTasksLocal() {
+  try {
+    const data = localStorage.getItem('layerBacklogTasks');
+    return data ? JSON.parse(data) : [];
+  } catch (e) {
+    return [];
+  }
 }
 
-// Load project updates
-async function loadProjectUpdates(projectId) {
-  const res = await query(
-    'SELECT * FROM project_updates WHERE project_id = $1 ORDER BY time DESC',
-    [projectId]
-  );
-  return res.rows;
+function addBacklogTaskLocal(title) {
+  const tasks = loadBacklogTasksLocal();
+  const newTask = {
+    id: 'BACKLOG-' + Date.now(),
+    title: title,
+    done: false,
+    createdAt: new Date().toISOString()
+  };
+  tasks.push(newTask);
+  localStorage.setItem('layerBacklogTasks', JSON.stringify(tasks));
+  return newTask;
 }
 
-// Attachments: Add (binary data)
-async function addAttachment(entityType, entityId, file) {
-  // file: {name, type, size, data: Buffer}
-  await query(
-    `INSERT INTO attachments (entity_type, entity_id, name, mime_type, size, data)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [entityType, entityId, file.name, file.type, file.size, file.data]
-  );
+function toggleBacklogTaskLocal(index) {
+  const tasks = loadBacklogTasksLocal();
+  if (tasks[index]) {
+    tasks[index].done = !tasks[index].done;
+    localStorage.setItem('layerBacklogTasks', JSON.stringify(tasks));
+  }
+  return tasks;
 }
 
-// Load attachments for entity
-async function loadAttachments(entityType, entityId) {
-  const res = await query(
-    'SELECT id, name, mime_type AS type, size, uploaded_at FROM attachments WHERE entity_type = $1 AND entity_id = $2',
-    [entityType, entityId]
-  );
-  // Data not loaded; fetch separately if needed
-  return res.rows;
+function deleteBacklogTaskLocal(index) {
+  const tasks = loadBacklogTasksLocal();
+  tasks.splice(index, 1);
+  localStorage.setItem('layerBacklogTasks', JSON.stringify(tasks));
+  return tasks;
 }
 
-// Get attachment data
-async function getAttachmentData(attachId) {
-  const res = await query('SELECT data FROM attachments WHERE id = $1', [attachId]);
-  return res.rows[0]?.data;
+function loadIssuesLocal() {
+  try {
+    const data = localStorage.getItem('layerMyIssues');
+    return data ? JSON.parse(data) : [];
+  } catch (e) {
+    return [];
+  }
 }
 
-// Delete attachment
-async function deleteAttachment(attachId) {
-  await query('DELETE FROM attachments WHERE id = $1', [attachId]);
+function addIssueLocal(issueData) {
+  const issues = loadIssuesLocal();
+  const newIssue = {
+    id: 'LAYER-' + Math.floor(1000 + Math.random() * 9000),
+    title: issueData.title,
+    description: issueData.description || '',
+    status: issueData.status || 'todo',
+    priority: issueData.priority || 'medium',
+    assignee: issueData.assignee || '',
+    dueDate: issueData.dueDate,
+    updated: 'just now'
+  };
+  issues.unshift(newIssue);
+  localStorage.setItem('layerMyIssues', JSON.stringify(issues));
+  return issues;
 }
 
-// Export all functions
-module.exports = {
-  loadProjects,
-  saveProjects,
-  addProject,
-  updateProject,
-  deleteProject,
-  addTaskToColumn,
-  toggleTaskDone,
-  deleteTask,
-  loadBacklogTasks,
-  addBacklogTask,
-  updateBacklogTask,
-  deleteBacklogTask,
-  loadIssues,
-  addIssue,
-  updateIssue,
-  deleteIssue,
-  loadCalendarEvents,
-  addCalendarEvent,
-  toggleEventCompleted,
-  deleteCalendarEvent,
-  loadDocs,
-  saveDoc,
-  addDoc,
-  deleteDoc,
-  loadExcels,
-  addExcel,
-  saveExcelGrid,
-  deleteExcel,
-  loadAssignments,
-  addAssignment,
-  updateAssignment,
-  deleteAssignment,
-  addProjectUpdate,
-  loadProjectUpdates,
-  addAttachment,
-  loadAttachments,
-  getAttachmentData,
-  deleteAttachment,
-  // Add more as needed for full coverage
-};
+function loadAssignmentsLocal() {
+  try {
+    const data = localStorage.getItem('layerAssignments');
+    return data ? JSON.parse(data) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function addAssignmentLocal(assignmentData) {
+  const assignments = loadAssignmentsLocal();
+  const newAssignment = {
+    id: 'ASSIGN-' + Date.now(),
+    ...assignmentData,
+    created: new Date().toISOString()
+  };
+  assignments.unshift(newAssignment);
+  localStorage.setItem('layerAssignments', JSON.stringify(assignments));
+  return newAssignment;
+}
+
+function deleteAssignmentLocal(index) {
+  const assignments = loadAssignmentsLocal();
+  assignments.splice(index, 1);
+  localStorage.setItem('layerAssignments', JSON.stringify(assignments));
+  return assignments;
+}
+
+// ============================================
+// Export for global use
+// ============================================
+if (typeof window !== 'undefined') {
+  window.LayerDB = {
+    initSupabase,
+    getCurrentUser,
+    getSession,
+    isAuthenticated,
+    openAuthModal,
+    handleSignOut,
+    // Database operations
+    loadProjects: dbLoadProjects,
+    addProject: dbAddProject,
+    updateProject: dbUpdateProject,
+    deleteProject: dbDeleteProject,
+    loadBacklogTasks: dbLoadBacklogTasks,
+    addBacklogTask: dbAddBacklogTask,
+    toggleBacklogTask: dbToggleBacklogTask,
+    deleteBacklogTask: dbDeleteBacklogTask,
+    loadIssues: dbLoadIssues,
+    addIssue: dbAddIssue,
+    loadAssignments: dbLoadAssignments,
+    addAssignment: dbAddAssignment,
+    deleteAssignment: dbDeleteAssignment
+  };
+}
