@@ -1348,12 +1348,27 @@ function saveCalendarSettings(settings) {
 }
 
 function loadCalendarEvents() {
+  // Use Supabase if authenticated (sync happens async)
+  if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+    // Return cached data or localStorage fallback
+    // Actual sync happens via async function
+    try { return JSON.parse(localStorage.getItem(EVENTS_KEY)) || []; }
+    catch { return []; }
+  }
   try { return JSON.parse(localStorage.getItem(EVENTS_KEY)) || []; }
   catch { return []; }
 }
 
 function saveCalendarEvents(events) {
+  // Save to localStorage immediately for responsiveness
   localStorage.setItem(EVENTS_KEY, JSON.stringify(events));
+  
+  // Sync to Supabase if authenticated
+  if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+    window.LayerDB.saveAllCalendarEvents(events).catch(err => {
+      console.error('Failed to sync calendar events to Supabase:', err);
+    });
+  }
 }
 
 // Generate unique event ID
@@ -13769,6 +13784,11 @@ document.addEventListener('click', (e) => {
 // Doc Storage
 // ============================================
 function loadDocs() {
+  // Use Supabase if authenticated
+  if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+    try { return JSON.parse(localStorage.getItem(DOCS_KEY)) || []; }
+    catch { return []; }
+  }
   try {
     return JSON.parse(localStorage.getItem(DOCS_KEY)) || [];
   } catch {
@@ -13777,7 +13797,43 @@ function loadDocs() {
 }
 
 function saveDocs(docs) {
+  // Save to localStorage immediately
   localStorage.setItem(DOCS_KEY, JSON.stringify(docs));
+  
+  // Sync to Supabase if authenticated  
+  if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+    // Sync docs to Supabase (delete and re-insert all)
+    syncDocsToSupabase(docs);
+  }
+}
+
+async function syncDocsToSupabase(docs) {
+  try {
+    const user = window.LayerDB.getCurrentUser();
+    if (!user) return;
+    
+    // Delete all existing docs for user
+    await window.LayerDB.supabase
+      .from('docs')
+      .delete()
+      .eq('user_id', user.id);
+    
+    // Insert all docs
+    if (docs.length > 0) {
+      const dbDocs = docs.map(d => ({
+        user_id: user.id,
+        title: d.title || 'Untitled',
+        content: d.content || '',
+        space_id: d.spaceId || null
+      }));
+      
+      await window.LayerDB.supabase
+        .from('docs')
+        .insert(dbDocs);
+    }
+  } catch (err) {
+    console.error('Failed to sync docs to Supabase:', err);
+  }
 }
 
 function addDoc(doc) {
@@ -14418,6 +14474,11 @@ function confirmSaveDocToSpace(spaceId) {
 // Excel Storage
 // ============================================
 function loadExcels() {
+  // Use Supabase if authenticated
+  if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+    try { return JSON.parse(localStorage.getItem(EXCELS_KEY)) || []; }
+    catch { return []; }
+  }
   try {
     return JSON.parse(localStorage.getItem(EXCELS_KEY)) || [];
   } catch {
@@ -14426,7 +14487,42 @@ function loadExcels() {
 }
 
 function saveExcels(excels) {
+  // Save to localStorage immediately
   localStorage.setItem(EXCELS_KEY, JSON.stringify(excels));
+  
+  // Sync to Supabase if authenticated
+  if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+    syncExcelsToSupabase(excels);
+  }
+}
+
+async function syncExcelsToSupabase(excels) {
+  try {
+    const user = window.LayerDB.getCurrentUser();
+    if (!user) return;
+    
+    // Delete all existing excels for user
+    await window.LayerDB.supabase
+      .from('excels')
+      .delete()
+      .eq('user_id', user.id);
+    
+    // Insert all excels
+    if (excels.length > 0) {
+      const dbExcels = excels.map(e => ({
+        user_id: user.id,
+        title: e.title || 'Untitled Sheet',
+        data: e.data || [],
+        space_id: e.spaceId || null
+      }));
+      
+      await window.LayerDB.supabase
+        .from('excels')
+        .insert(dbExcels);
+    }
+  } catch (err) {
+    console.error('Failed to sync excels to Supabase:', err);
+  }
 }
 
 // ============================================
@@ -14874,6 +14970,11 @@ function saveAssignments(assignments) {
 // Spaces
 // ============================================
 function loadSpaces() {
+  // Use Supabase if authenticated
+  if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+    try { return JSON.parse(localStorage.getItem(SPACES_KEY)) || []; }
+    catch { return []; }
+  }
   try {
     return JSON.parse(localStorage.getItem(SPACES_KEY)) || [];
   } catch {
@@ -14882,7 +14983,42 @@ function loadSpaces() {
 }
 
 function saveSpaces(spaces) {
+  // Save to localStorage immediately
   localStorage.setItem(SPACES_KEY, JSON.stringify(spaces));
+  
+  // Sync to Supabase if authenticated
+  if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+    syncSpacesToSupabase(spaces);
+  }
+}
+
+async function syncSpacesToSupabase(spaces) {
+  try {
+    const user = window.LayerDB.getCurrentUser();
+    if (!user) return;
+    
+    // Delete all existing spaces for user
+    await window.LayerDB.supabase
+      .from('spaces')
+      .delete()
+      .eq('user_id', user.id);
+    
+    // Insert all spaces
+    if (spaces.length > 0) {
+      const dbSpaces = spaces.map(s => ({
+        user_id: user.id,
+        name: s.name || 'New Space',
+        color: s.color || '#3b82f6',
+        icon: s.icon || 'folder'
+      }));
+      
+      await window.LayerDB.supabase
+        .from('spaces')
+        .insert(dbSpaces);
+    }
+  } catch (err) {
+    console.error('Failed to sync spaces to Supabase:', err);
+  }
 }
 
 // Minimalistic SVG icons for spaces (instead of emojis)

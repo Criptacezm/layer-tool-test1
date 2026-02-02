@@ -87,6 +87,8 @@ function loadProjects() {
               data: { label: project.description.trim(), headerColor: '#89b4fa' }
             });
           }
+          // Clear old description if desired
+          // project.description = '';
         }
         project.columns = project.columns || [
           { title: 'To Do', tasks: [] },
@@ -105,8 +107,51 @@ function loadProjects() {
 function saveProjects(projects) {
   try {
     localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects));
+    
+    // Sync to Supabase if authenticated
+    if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+      syncProjectsToSupabase(projects);
+    }
   } catch (e) {
     console.error('Failed to save projects:', e);
+  }
+}
+
+async function syncProjectsToSupabase(projects) {
+  try {
+    const user = window.LayerDB.getCurrentUser();
+    if (!user) return;
+    
+    // Delete all existing projects for user
+    await window.LayerDB.supabase
+      .from('projects')
+      .delete()
+      .eq('user_id', user.id);
+    
+    // Insert all projects
+    if (projects.length > 0) {
+      const dbProjects = projects.map(p => ({
+        user_id: user.id,
+        name: p.name,
+        description: p.description || '',
+        status: p.status || 'todo',
+        start_date: p.startDate || new Date().toISOString().split('T')[0],
+        target_date: p.targetDate || null,
+        flowchart: p.flowchart || { nodes: [], edges: [] },
+        columns: p.columns || [
+          { title: 'To Do', tasks: [] },
+          { title: 'In Progress', tasks: [] },
+          { title: 'Done', tasks: [] }
+        ],
+        updates: p.updates || []
+      }));
+      
+      await window.LayerDB.supabase
+        .from('projects')
+        .insert(dbProjects);
+    }
+  } catch (err) {
+    console.error('Failed to sync projects to Supabase:', err);
   }
 }
 
@@ -240,8 +285,41 @@ function loadBacklogTasks() {
 function saveBacklogTasks(tasks) {
   try {
     localStorage.setItem(BACKLOG_KEY, JSON.stringify(tasks));
+    
+    // Sync to Supabase if authenticated
+    if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+      syncBacklogToSupabase(tasks);
+    }
   } catch (e) {
     console.error('Failed to save backlog tasks:', e);
+  }
+}
+
+async function syncBacklogToSupabase(tasks) {
+  try {
+    const user = window.LayerDB.getCurrentUser();
+    if (!user) return;
+    
+    // Delete all existing backlog tasks for user
+    await window.LayerDB.supabase
+      .from('backlog_tasks')
+      .delete()
+      .eq('user_id', user.id);
+    
+    // Insert all tasks
+    if (tasks.length > 0) {
+      const dbTasks = tasks.map(t => ({
+        user_id: user.id,
+        title: t.title,
+        done: t.done || false
+      }));
+      
+      await window.LayerDB.supabase
+        .from('backlog_tasks')
+        .insert(dbTasks);
+    }
+  } catch (err) {
+    console.error('Failed to sync backlog to Supabase:', err);
   }
 }
 
@@ -301,8 +379,46 @@ function loadIssues() {
 function saveIssues(issues) {
   try {
     localStorage.setItem(ISSUES_KEY, JSON.stringify(issues));
+    
+    // Sync to Supabase if authenticated
+    if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+      syncIssuesToSupabase(issues);
+    }
   } catch (e) {
     console.error('Failed to save issues:', e);
+  }
+}
+
+async function syncIssuesToSupabase(issues) {
+  try {
+    const user = window.LayerDB.getCurrentUser();
+    if (!user) return;
+    
+    // Delete all existing issues for user
+    await window.LayerDB.supabase
+      .from('issues')
+      .delete()
+      .eq('user_id', user.id);
+    
+    // Insert all issues
+    if (issues.length > 0) {
+      const dbIssues = issues.map(i => ({
+        user_id: user.id,
+        issue_id: i.id || generateIssueId(),
+        title: i.title,
+        description: i.description || '',
+        status: i.status || 'todo',
+        priority: i.priority || 'medium',
+        assignee: i.assignee || '',
+        due_date: i.dueDate || null
+      }));
+      
+      await window.LayerDB.supabase
+        .from('issues')
+        .insert(dbIssues);
+    }
+  } catch (err) {
+    console.error('Failed to sync issues to Supabase:', err);
   }
 }
 
@@ -339,11 +455,6 @@ function saveTheme(theme) {
 // ============================================
 function getRecentActivity(projects) {
   const activity = [];
-  
-  // Handle case where projects might be a promise or undefined
-  if (!projects || !Array.isArray(projects)) {
-    return activity;
-  }
 
   projects.slice().reverse().forEach(project => {
     activity.push({

@@ -1,40 +1,282 @@
--- PostgreSQL Data Model for Layer App
--- Version: 1.0
--- Description: Production-ready schema based on app's entities and relationships.
--- Assumes PostgreSQL 14+ for features like generated columns if needed.
--- Key decisions:
--- - Use UUID for primary keys to allow distributed generation.
--- - Enums for constrained fields (statuses, priorities).
--- - JSONB for flexible, semi-structured data (e.g., positions, flowchart data, excel grids).
--- - Timestamps for auditing (created_at, updated_at).
--- - Foreign keys with CASCADE deletes for hierarchies.
--- - Indexes on frequent query fields (e.g., status, dates, assignees).
--- - Users table for multi-user support (assignees, actors, reporters).
--- - Attachments as polymorphic (entity_type enum) with BYTEA for binary data.
--- - Whiteboard elements (from grip-diagram.js) normalized under projects.
+-- ============================================
+-- Layer App - Fixed Database Schema for Supabase
+-- Version: 2.0
+-- Run this in Supabase SQL Editor
+-- ============================================
 
--- Enable UUID extension if not already
+-- IMPORTANT: This script drops and recreates all tables
+-- Make sure to backup any existing data first!
+
+-- Drop existing tables (in reverse dependency order)
+DROP TABLE IF EXISTS recurring_tasks CASCADE;
+DROP TABLE IF EXISTS user_preferences CASCADE;
+DROP TABLE IF EXISTS spaces CASCADE;
+DROP TABLE IF EXISTS excels CASCADE;
+DROP TABLE IF EXISTS docs CASCADE;
+DROP TABLE IF EXISTS calendar_events CASCADE;
+DROP TABLE IF EXISTS issues CASCADE;
+DROP TABLE IF EXISTS backlog_tasks CASCADE;
+DROP TABLE IF EXISTS projects CASCADE;
+DROP TABLE IF EXISTS profiles CASCADE;
+
+-- Drop existing types
+DROP TYPE IF EXISTS project_status CASCADE;
+DROP TYPE IF EXISTS task_status CASCADE;
+DROP TYPE IF EXISTS priority_level CASCADE;
+
+-- Enable UUID extension
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
+-- ============================================
 -- Enum Types
+-- ============================================
 CREATE TYPE project_status AS ENUM ('todo', 'in_progress', 'review', 'done', 'backlog');
 CREATE TYPE task_status AS ENUM ('todo', 'in_progress', 'done');
 CREATE TYPE priority_level AS ENUM ('low', 'medium', 'high', 'urgent');
-CREATE TYPE entity_type AS ENUM ('project', 'document', 'excel', 'issue', 'assignment');
-CREATE TYPE flowchart_node_type AS ENUM ('flowNode', 'cell', 'textBox', 'image');  -- Expanded from app's types
-CREATE TYPE connection_position AS ENUM ('top', 'bottom', 'left', 'right');
 
--- Users Table (for assignees, actors, reporters; single-user initially, but scalable)
-CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name VARCHAR(255) NOT NULL UNIQUE,
-    email VARCHAR(255) UNIQUE,
+-- ============================================
+-- Profiles Table (linked to auth.users)
+-- ============================================
+CREATE TABLE profiles (
+    id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    email TEXT,
+    name TEXT,
+    avatar_url TEXT,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- Trigger for updated_at
-CREATE OR REPLACE FUNCTION update_timestamp()
+-- ============================================
+-- User Preferences Table
+-- ============================================
+CREATE TABLE user_preferences (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    theme TEXT DEFAULT 'dark',
+    left_panel_width INTEGER DEFAULT 280,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id)
+);
+
+-- ============================================
+-- Projects Table (matches supabase-client.js)
+-- ============================================
+CREATE TABLE projects (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    status project_status NOT NULL DEFAULT 'todo',
+    start_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    target_date DATE,
+    flowchart JSONB DEFAULT '{"nodes": [], "edges": []}',
+    columns JSONB DEFAULT '[{"title": "To Do", "tasks": []}, {"title": "In Progress", "tasks": []}, {"title": "Done", "tasks": []}]',
+    updates JSONB DEFAULT '[]',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================
+-- Backlog Tasks Table
+-- ============================================
+CREATE TABLE backlog_tasks (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    done BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================
+-- Issues Table
+-- ============================================
+CREATE TABLE issues (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    issue_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    status project_status NOT NULL DEFAULT 'todo',
+    priority priority_level NOT NULL DEFAULT 'medium',
+    assignee TEXT DEFAULT '',
+    due_date DATE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================
+-- Calendar Events Table
+-- ============================================
+CREATE TABLE calendar_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    date DATE NOT NULL,
+    time TEXT,
+    end_time TEXT,
+    duration INTEGER,
+    completed BOOLEAN DEFAULT FALSE,
+    color TEXT,
+    recurring_id TEXT,
+    is_recurring_instance BOOLEAN DEFAULT FALSE,
+    notes TEXT,
+    priority priority_level DEFAULT 'medium',
+    category TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================
+-- Docs Table
+-- ============================================
+CREATE TABLE docs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL DEFAULT 'Untitled',
+    content TEXT DEFAULT '',
+    space_id UUID,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================
+-- Excels/Sheets Table
+-- ============================================
+CREATE TABLE excels (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL DEFAULT 'Untitled Sheet',
+    data JSONB DEFAULT '[]',
+    space_id UUID,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================
+-- Spaces Table
+-- ============================================
+CREATE TABLE spaces (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL DEFAULT 'New Space',
+    color TEXT DEFAULT '#3b82f6',
+    icon TEXT DEFAULT 'folder',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================
+-- Recurring Tasks Table
+-- ============================================
+CREATE TABLE recurring_tasks (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    time TEXT,
+    frequency TEXT DEFAULT 'daily',
+    days_of_week JSONB,
+    color TEXT,
+    start_date DATE,
+    end_date DATE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================
+-- Indexes for Performance
+-- ============================================
+CREATE INDEX idx_projects_user_id ON projects(user_id);
+CREATE INDEX idx_projects_status ON projects(status);
+CREATE INDEX idx_backlog_tasks_user_id ON backlog_tasks(user_id);
+CREATE INDEX idx_issues_user_id ON issues(user_id);
+CREATE INDEX idx_issues_status ON issues(status);
+CREATE INDEX idx_calendar_events_user_id ON calendar_events(user_id);
+CREATE INDEX idx_calendar_events_date ON calendar_events(date);
+CREATE INDEX idx_docs_user_id ON docs(user_id);
+CREATE INDEX idx_excels_user_id ON excels(user_id);
+CREATE INDEX idx_spaces_user_id ON spaces(user_id);
+CREATE INDEX idx_recurring_tasks_user_id ON recurring_tasks(user_id);
+
+-- ============================================
+-- Row Level Security (RLS) Policies
+-- ============================================
+
+-- Enable RLS on all tables
+ALTER TABLE profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_preferences ENABLE ROW LEVEL SECURITY;
+ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE backlog_tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE issues ENABLE ROW LEVEL SECURITY;
+ALTER TABLE calendar_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE excels ENABLE ROW LEVEL SECURITY;
+ALTER TABLE spaces ENABLE ROW LEVEL SECURITY;
+ALTER TABLE recurring_tasks ENABLE ROW LEVEL SECURITY;
+
+-- Profiles policies
+CREATE POLICY "Users can view own profile" ON profiles FOR SELECT USING (auth.uid() = id);
+CREATE POLICY "Users can update own profile" ON profiles FOR UPDATE USING (auth.uid() = id);
+CREATE POLICY "Users can insert own profile" ON profiles FOR INSERT WITH CHECK (auth.uid() = id);
+
+-- User Preferences policies
+CREATE POLICY "Users can view own preferences" ON user_preferences FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can update own preferences" ON user_preferences FOR UPDATE USING (auth.uid() = user_id);
+CREATE POLICY "Users can insert own preferences" ON user_preferences FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+-- Projects policies
+CREATE POLICY "Users can view own projects" ON projects FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can insert own projects" ON projects FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can update own projects" ON projects FOR UPDATE USING (auth.uid() = user_id);
+CREATE POLICY "Users can delete own projects" ON projects FOR DELETE USING (auth.uid() = user_id);
+
+-- Backlog Tasks policies
+CREATE POLICY "Users can view own backlog_tasks" ON backlog_tasks FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can insert own backlog_tasks" ON backlog_tasks FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can update own backlog_tasks" ON backlog_tasks FOR UPDATE USING (auth.uid() = user_id);
+CREATE POLICY "Users can delete own backlog_tasks" ON backlog_tasks FOR DELETE USING (auth.uid() = user_id);
+
+-- Issues policies
+CREATE POLICY "Users can view own issues" ON issues FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can insert own issues" ON issues FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can update own issues" ON issues FOR UPDATE USING (auth.uid() = user_id);
+CREATE POLICY "Users can delete own issues" ON issues FOR DELETE USING (auth.uid() = user_id);
+
+-- Calendar Events policies
+CREATE POLICY "Users can view own calendar_events" ON calendar_events FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can insert own calendar_events" ON calendar_events FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can update own calendar_events" ON calendar_events FOR UPDATE USING (auth.uid() = user_id);
+CREATE POLICY "Users can delete own calendar_events" ON calendar_events FOR DELETE USING (auth.uid() = user_id);
+
+-- Docs policies
+CREATE POLICY "Users can view own docs" ON docs FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can insert own docs" ON docs FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can update own docs" ON docs FOR UPDATE USING (auth.uid() = user_id);
+CREATE POLICY "Users can delete own docs" ON docs FOR DELETE USING (auth.uid() = user_id);
+
+-- Excels policies
+CREATE POLICY "Users can view own excels" ON excels FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can insert own excels" ON excels FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can update own excels" ON excels FOR UPDATE USING (auth.uid() = user_id);
+CREATE POLICY "Users can delete own excels" ON excels FOR DELETE USING (auth.uid() = user_id);
+
+-- Spaces policies
+CREATE POLICY "Users can view own spaces" ON spaces FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can insert own spaces" ON spaces FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can update own spaces" ON spaces FOR UPDATE USING (auth.uid() = user_id);
+CREATE POLICY "Users can delete own spaces" ON spaces FOR DELETE USING (auth.uid() = user_id);
+
+-- Recurring Tasks policies
+CREATE POLICY "Users can view own recurring_tasks" ON recurring_tasks FOR SELECT USING (auth.uid() = user_id);
+CREATE POLICY "Users can insert own recurring_tasks" ON recurring_tasks FOR INSERT WITH CHECK (auth.uid() = user_id);
+CREATE POLICY "Users can update own recurring_tasks" ON recurring_tasks FOR UPDATE USING (auth.uid() = user_id);
+CREATE POLICY "Users can delete own recurring_tasks" ON recurring_tasks FOR DELETE USING (auth.uid() = user_id);
+
+-- ============================================
+-- Trigger for auto-updating timestamps
+-- ============================================
+CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = CURRENT_TIMESTAMP;
@@ -42,274 +284,36 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER users_update_timestamp
-BEFORE UPDATE ON users
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+-- Apply triggers to all tables
+CREATE TRIGGER update_profiles_updated_at BEFORE UPDATE ON profiles FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_user_preferences_updated_at BEFORE UPDATE ON user_preferences FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_projects_updated_at BEFORE UPDATE ON projects FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_backlog_tasks_updated_at BEFORE UPDATE ON backlog_tasks FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_issues_updated_at BEFORE UPDATE ON issues FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_calendar_events_updated_at BEFORE UPDATE ON calendar_events FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_docs_updated_at BEFORE UPDATE ON docs FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_excels_updated_at BEFORE UPDATE ON excels FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_spaces_updated_at BEFORE UPDATE ON spaces FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_recurring_tasks_updated_at BEFORE UPDATE ON recurring_tasks FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
--- Projects Table
-CREATE TABLE projects (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    name VARCHAR(255) NOT NULL,
-    status project_status NOT NULL DEFAULT 'todo',
-    start_date DATE NOT NULL,
-    target_date DATE,
-    description TEXT,
-    user_id UUID REFERENCES users(id) ON DELETE SET NULL,  -- Owner/creator
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+-- ============================================
+-- Trigger for auto-creating profile on signup
+-- ============================================
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO public.profiles (id, email)
+    VALUES (new.id, new.email);
+    RETURN new;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
 
-CREATE TRIGGER projects_update_timestamp
-BEFORE UPDATE ON projects
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
+-- Drop existing trigger if exists and recreate
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+CREATE TRIGGER on_auth_user_created
+    AFTER INSERT ON auth.users
+    FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
 
--- Indexes
-CREATE INDEX idx_projects_status ON projects(status);
-CREATE INDEX idx_projects_user_id ON projects(user_id);
-CREATE INDEX idx_projects_dates ON projects(start_date, target_date);
-
--- Columns Table (Kanban columns per project)
-CREATE TABLE project_columns (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    title VARCHAR(100) NOT NULL,
-    position INTEGER NOT NULL DEFAULT 0,  -- For ordering
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TRIGGER project_columns_update_timestamp
-BEFORE UPDATE ON project_columns
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- Unique constraint for title per project
-ALTER TABLE project_columns ADD CONSTRAINT unique_column_title_per_project UNIQUE (project_id, title);
-
--- Indexes
-CREATE INDEX idx_project_columns_project_id ON project_columns(project_id);
-
--- Tasks Table (Embedded in columns)
-CREATE TABLE tasks (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    column_id UUID NOT NULL REFERENCES project_columns(id) ON DELETE CASCADE,
-    title VARCHAR(255) NOT NULL,
-    done BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TRIGGER tasks_update_timestamp
-BEFORE UPDATE ON tasks
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- Indexes
-CREATE INDEX idx_tasks_column_id ON tasks(column_id);
-CREATE INDEX idx_tasks_done ON tasks(done);
-
--- Updates Table (Comments/activities per project)
-CREATE TABLE project_updates (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    actor_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    message TEXT NOT NULL,
-    time TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- Indexes
-CREATE INDEX idx_project_updates_project_id ON project_updates(project_id);
-CREATE INDEX idx_project_updates_time ON project_updates(time);
-
--- Flowchart/Whiteboard Elements
--- Nodes (cells, textboxes, images, etc.)
-CREATE TABLE flowchart_nodes (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    type flowchart_node_type NOT NULL,
-    position JSONB NOT NULL,  -- e.g., {"x": 50, "y": 50}
-    data JSONB NOT NULL,  -- e.g., {"label": "text", "headerColor": "#89b4fa", "width": 200, "height": 120}
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TRIGGER flowchart_nodes_update_timestamp
-BEFORE UPDATE ON flowchart_nodes
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- Indexes
-CREATE INDEX idx_flowchart_nodes_project_id ON flowchart_nodes(project_id);
-CREATE INDEX idx_flowchart_nodes_type ON flowchart_nodes(type);
-
--- Connections/Edges
-CREATE TABLE flowchart_connections (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    project_id UUID NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    from_node_id UUID NOT NULL REFERENCES flowchart_nodes(id) ON DELETE CASCADE,
-    from_position connection_position,
-    to_node_id UUID NOT NULL REFERENCES flowchart_nodes(id) ON DELETE CASCADE,
-    to_position connection_position,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- Indexes
-CREATE INDEX idx_flowchart_connections_project_id ON flowchart_connections(project_id);
-CREATE INDEX idx_flowchart_connections_from_node ON flowchart_connections(from_node_id);
-CREATE INDEX idx_flowchart_connections_to_node ON flowchart_connections(to_node_id);
-
--- Backlog Tasks (Global)
-CREATE TABLE backlog_tasks (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    title VARCHAR(255) NOT NULL,
-    status task_status NOT NULL DEFAULT 'todo',
-    priority priority_level NOT NULL DEFAULT 'medium',
-    assignee_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    due_date DATE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TRIGGER backlog_tasks_update_timestamp
-BEFORE UPDATE ON backlog_tasks
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- Indexes
-CREATE INDEX idx_backlog_tasks_status ON backlog_tasks(status);
-CREATE INDEX idx_backlog_tasks_priority ON backlog_tasks(priority);
-CREATE INDEX idx_backlog_tasks_assignee ON backlog_tasks(assignee_id);
-CREATE INDEX idx_backlog_tasks_due_date ON backlog_tasks(due_date);
-
--- Issues (Global)
-CREATE TABLE issues (
-    id VARCHAR(50) PRIMARY KEY,  -- e.g., 'LAYER-XXXX'
-    title VARCHAR(255) NOT NULL,
-    status project_status NOT NULL DEFAULT 'todo',
-    priority priority_level NOT NULL DEFAULT 'medium',
-    assignee_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    reporter_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    description TEXT
-);
-
-CREATE TRIGGER issues_update_timestamp
-BEFORE UPDATE ON issues
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- Indexes
-CREATE INDEX idx_issues_status ON issues(status);
-CREATE INDEX idx_issues_priority ON issues(priority);
-CREATE INDEX idx_issues_assignee ON issues(assignee_id);
-CREATE INDEX idx_issues_reporter ON issues(reporter_id);
-
--- Calendar Events (Global)
-CREATE TABLE calendar_events (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    title VARCHAR(255) NOT NULL,
-    date DATE NOT NULL,
-    time VARCHAR(50),  -- e.g., '14:30'
-    description TEXT,
-    completed BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TRIGGER calendar_events_update_timestamp
-BEFORE UPDATE ON calendar_events
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- Indexes
-CREATE INDEX idx_calendar_events_date ON calendar_events(date);
-CREATE INDEX idx_calendar_events_completed ON calendar_events(completed);
-
--- Documents (Global)
-CREATE TABLE documents (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    title VARCHAR(255) NOT NULL DEFAULT 'Untitled',
-    content TEXT NOT NULL,  -- HTML content
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TRIGGER documents_update_timestamp
-BEFORE UPDATE ON documents
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- Excels (Global)
-CREATE TABLE excels (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    title VARCHAR(255) NOT NULL DEFAULT 'Untitled',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TRIGGER excels_update_timestamp
-BEFORE UPDATE ON excels
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- Sheets (Per Excel)
-CREATE TABLE excel_sheets (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    excel_id UUID NOT NULL REFERENCES excels(id) ON DELETE CASCADE,
-    name VARCHAR(100) NOT NULL,
-    grid_data JSONB NOT NULL,  -- Array of arrays for rows/cells, e.g., [["A1", "B1"], ["A2", "B2"]]
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TRIGGER excel_sheets_update_timestamp
-BEFORE UPDATE ON excel_sheets
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- Indexes
-CREATE INDEX idx_excel_sheets_excel_id ON excel_sheets(excel_id);
-
--- Assignments (Global)
-CREATE TABLE assignments (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    title VARCHAR(255) NOT NULL,
-    status project_status NOT NULL DEFAULT 'todo',
-    priority priority_level NOT NULL DEFAULT 'medium',
-    assignee_id UUID REFERENCES users(id) ON DELETE SET NULL,
-    due_date DATE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TRIGGER assignments_update_timestamp
-BEFORE UPDATE ON assignments
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- Indexes
-CREATE INDEX idx_assignments_status ON assignments(status);
-CREATE INDEX idx_assignments_priority ON assignments(priority);
-CREATE INDEX idx_assignments_assignee ON assignments(assignee_id);
-CREATE INDEX idx_assignments_due_date ON assignments(due_date);
-
--- Attachments (Polymorphic for projects, docs, excels, etc.)
-CREATE TABLE attachments (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    entity_type entity_type NOT NULL,
-    entity_id UUID NOT NULL,
-    name VARCHAR(255) NOT NULL,
-    mime_type VARCHAR(100) NOT NULL,  -- e.g., 'image/png'
-    size BIGINT NOT NULL,
-    data BYTEA NOT NULL,  -- Binary storage
-    uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
--- Composite index for polymorphic queries
-CREATE INDEX idx_attachments_entity ON attachments(entity_type, entity_id);
-
--- Themes (Per user, for personalization; global in app but user-scoped here)
-CREATE TABLE user_themes (
-    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    theme_name VARCHAR(50) NOT NULL DEFAULT 'dark',
-    theme_mode VARCHAR(50) NOT NULL DEFAULT 'dark',
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TRIGGER user_themes_update_timestamp
-BEFORE UPDATE ON user_themes
-FOR EACH ROW EXECUTE FUNCTION update_timestamp();
-
--- End of Schema
+-- ============================================
+-- Done! Your schema is ready.
+-- ============================================

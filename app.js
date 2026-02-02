@@ -536,94 +536,79 @@ function switchAuthMode(mode) {
   renderAuthModal();
 }
 
-async function handleAuthSubmit(event) {
+function handleAuthSubmit(event) {
   event.preventDefault();
   
   const email = document.getElementById('authEmail').value.trim();
   const password = document.getElementById('authPassword').value;
   const errorEl = document.getElementById('authError');
-  const submitBtn = event.target.querySelector('button[type="submit"]');
   
   // Clear previous errors
   errorEl.style.display = 'none';
   
-  // Disable submit button
-  if (submitBtn) {
-    submitBtn.disabled = true;
-    submitBtn.textContent = authMode === 'signin' ? 'Signing in...' : 'Creating account...';
-  }
-  
-  try {
-    if (authMode === 'signup') {
-      const username = document.getElementById('authUsername').value.trim();
-      const confirmPassword = document.getElementById('authConfirmPassword').value;
-      
-      // Validation
-      if (!email || !username || !password || !confirmPassword) {
-        showAuthError('Please fill in all fields');
-        return;
-      }
-      
-      if (password !== confirmPassword) {
-        showAuthError('Passwords do not match');
-        return;
-      }
-      
-      if (password.length < 6) {
-        showAuthError('Password must be at least 6 characters');
-        return;
-      }
-      
-      // Use Supabase signUp
-      const { user, session } = await window.LayerDB.signUp(email, password, username);
-      
-      closeModal();
-      
-      if (session) {
-        // Immediately signed in
-        updateUserDisplay({ username, email });
-        showToast('Account created successfully!', 'success');
-        
-        // Migrate local data to Supabase
-        await window.LayerDB.migrateLocalDataToSupabase();
-        renderCurrentView();
-      } else {
-        // Email confirmation required
-        showToast('Please check your email to confirm your account', 'info');
-      }
-      
-    } else {
-      // Sign In
-      if (!email || !password) {
-        showAuthError('Please enter your email and password');
-        return;
-      }
-      
-      // Use Supabase signIn
-      const { user, session } = await window.LayerDB.signIn(email, password);
-      
-      // Get profile for username
-      const profile = await window.LayerDB.getProfile();
-      
-      closeModal();
-      updateUserDisplay({ 
-        username: profile?.username || email.split('@')[0], 
-        email 
-      });
-      showToast('Signed in successfully!', 'success');
-      
-      // Reload views with Supabase data
-      renderCurrentView();
+  if (authMode === 'signup') {
+    const username = document.getElementById('authUsername').value.trim();
+    const confirmPassword = document.getElementById('authConfirmPassword').value;
+    
+    // Validation
+    if (!email || !username || !password || !confirmPassword) {
+      showAuthError('Please fill in all fields');
+      return;
     }
-  } catch (error) {
-    console.error('Auth error:', error);
-    showAuthError(error.message || 'An error occurred. Please try again.');
-  } finally {
-    // Re-enable submit button
-    if (submitBtn) {
-      submitBtn.disabled = false;
-      submitBtn.textContent = authMode === 'signin' ? 'Sign In' : 'Create Account';
+    
+    if (password !== confirmPassword) {
+      showAuthError('Passwords do not match');
+      return;
     }
+    
+    if (password.length < 6) {
+      showAuthError('Password must be at least 6 characters');
+      return;
+    }
+    
+    // Store user data (localStorage simulation)
+    const users = JSON.parse(localStorage.getItem('layerUsers') || '[]');
+    
+    // Check if email already exists
+    if (users.find(u => u.email === email)) {
+      showAuthError('An account with this email already exists');
+      return;
+    }
+    
+    // Add new user
+    const newUser = {
+      id: Date.now().toString(),
+      email,
+      username,
+      password, // Note: In production, never store plain passwords
+      createdAt: new Date().toISOString()
+    };
+    
+    users.push(newUser);
+    localStorage.setItem('layerUsers', JSON.stringify(users));
+    localStorage.setItem('layerCurrentUser', JSON.stringify(newUser));
+    
+    closeModal();
+    updateUserDisplay(newUser);
+    
+  } else {
+    // Sign In
+    if (!email || !password) {
+      showAuthError('Please enter your email and password');
+      return;
+    }
+    
+    const users = JSON.parse(localStorage.getItem('layerUsers') || '[]');
+    const user = users.find(u => u.email === email && u.password === password);
+    
+    if (!user) {
+      showAuthError('Invalid email or password');
+      return;
+    }
+    
+    localStorage.setItem('layerCurrentUser', JSON.stringify(user));
+    closeModal();
+    updateUserDisplay(user);
   }
 }
 
@@ -636,12 +621,12 @@ function showAuthError(message) {
 function updateUserDisplay(user) {
   const signInBtn = document.getElementById('signInBtn');
   if (signInBtn && user) {
-    const initials = (user.username || user.email || 'U').slice(0, 2).toUpperCase();
+    const initials = user.username.slice(0, 2).toUpperCase();
     signInBtn.outerHTML = `
       <div class="user-info" id="userInfo">
         <div class="user-avatar">${initials}</div>
-        <span class="user-name">${user.username || user.email}</span>
-        <button class="sign-out-btn" onclick="handleSignOut()" title="Sign Out">
+        <span class="user-name">${user.username}</span>
+        <button class="sign-out-btn" onclick="signOut()" title="Sign Out">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
             <polyline points="16 17 21 12 16 7"/>
@@ -653,104 +638,137 @@ function updateUserDisplay(user) {
   }
 }
 
-async function handleSignOut() {
-  try {
-    await window.LayerDB.signOut();
-    
-    const userInfo = document.getElementById('userInfo');
-    if (userInfo) {
-      userInfo.outerHTML = `
-        <button class="sign-in-btn" id="signInBtn" onclick="openAuthModal()">
-          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
-            <polyline points="10 17 15 12 10 7"/>
-            <line x1="15" y1="12" x2="3" y2="12"/>
-          </svg>
-          <span>Sign In</span>
-        </button>
-      `;
-    }
-    
-    showToast('Signed out successfully', 'success');
-    renderCurrentView();
-  } catch (error) {
-    console.error('Sign out error:', error);
-    showToast('Failed to sign out', 'error');
+function signOut() {
+  localStorage.removeItem('layerCurrentUser');
+  const userInfo = document.getElementById('userInfo');
+  if (userInfo) {
+    userInfo.outerHTML = `
+      <button class="sign-in-btn" id="signInBtn" onclick="openAuthModal()">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+          <polyline points="10 17 15 12 10 7"/>
+          <line x1="15" y1="12" x2="3" y2="12"/>
+        </svg>
+        <span>Sign In</span>
+      </button>
+    `;
   }
 }
 
 async function checkExistingSession() {
-  try {
-    // Initialize Supabase auth
-    const { user, session } = await window.LayerDB.initAuth();
-    
-    if (user && session) {
-      const profile = await window.LayerDB.getProfile();
-      updateUserDisplay({ 
-        username: profile?.username || user.email?.split('@')[0], 
-        email: user.email 
-      });
-    }
-    
-    // Listen for auth state changes
-    window.addEventListener('authStateChanged', async (e) => {
-      const { user, session, event } = e.detail;
+  // Initialize Supabase auth if available
+  if (window.LayerDB && window.LayerDB.initAuth) {
+    try {
+      const { user, session } = await window.LayerDB.initAuth();
       
-      if (event === 'SIGNED_IN' && user) {
-        const profile = await window.LayerDB.getProfile();
-        updateUserDisplay({ 
-          username: profile?.username || user.email?.split('@')[0], 
-          email: user.email 
-        });
-        renderCurrentView();
-      } else if (event === 'SIGNED_OUT') {
-        const userInfo = document.getElementById('userInfo');
-        if (userInfo) {
-          userInfo.outerHTML = `
-            <button class="sign-in-btn" id="signInBtn" onclick="openAuthModal()">
-              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
-                <polyline points="10 17 15 12 10 7"/>
-                <line x1="15" y1="12" x2="3" y2="12"/>
-              </svg>
-              <span>Sign In</span>
-            </button>
-          `;
-        }
+      if (user) {
+        // User is logged in via Supabase
+        localStorage.setItem('layerCurrentUser', JSON.stringify({
+          name: user.email.split('@')[0],
+          email: user.email,
+          id: user.id
+        }));
+        updateUserDisplay({ name: user.email.split('@')[0], email: user.email });
+        
+        // Sync data from Supabase to localStorage
+        await syncDataFromSupabase();
+        
+        // Re-render to show synced data
         renderCurrentView();
       }
-    });
-  } catch (error) {
-    console.error('Session check error:', error);
+      
+      // Listen for auth state changes
+      window.addEventListener('authStateChanged', async (event) => {
+        const { user: authUser, event: authEvent } = event.detail;
+        
+        if (authEvent === 'SIGNED_IN' && authUser) {
+          localStorage.setItem('layerCurrentUser', JSON.stringify({
+            name: authUser.email.split('@')[0],
+            email: authUser.email,
+            id: authUser.id
+          }));
+          updateUserDisplay({ name: authUser.email.split('@')[0], email: authUser.email });
+          
+          // Sync data from Supabase
+          await syncDataFromSupabase();
+          renderCurrentView();
+        } else if (authEvent === 'SIGNED_OUT') {
+          localStorage.removeItem('layerCurrentUser');
+          updateUserDisplay(null);
+          renderCurrentView();
+        }
+      });
+      
+    } catch (err) {
+      console.error('Failed to initialize Supabase auth:', err);
+      // Fall back to localStorage session
+      const currentUser = localStorage.getItem('layerCurrentUser');
+      if (currentUser) {
+        updateUserDisplay(JSON.parse(currentUser));
+      }
+    }
+  } else {
+    // Supabase not available, use localStorage
+    const currentUser = localStorage.getItem('layerCurrentUser');
+    if (currentUser) {
+      updateUserDisplay(JSON.parse(currentUser));
+    }
   }
 }
 
-// Toast notification helper
-function showToast(message, type = 'info') {
-  const toast = document.createElement('div');
-  toast.className = `toast toast-${type}`;
-  toast.innerHTML = `
-    <span>${message}</span>
-    <button onclick="this.parentElement.remove()">×</button>
-  `;
+// Sync all data from Supabase to localStorage
+async function syncDataFromSupabase() {
+  if (!window.LayerDB || !window.LayerDB.isAuthenticated()) return;
   
-  // Add toast container if not exists
-  let container = document.getElementById('toastContainer');
-  if (!container) {
-    container = document.createElement('div');
-    container.id = 'toastContainer';
-    container.className = 'toast-container';
-    document.body.appendChild(container);
-  }
-  
-  container.appendChild(toast);
-  
-  // Auto-remove after 5 seconds
-  setTimeout(() => {
-    if (toast.parentElement) {
-      toast.remove();
+  try {
+    console.log('Syncing data from Supabase...');
+    
+    // Sync calendar events
+    const events = await window.LayerDB.loadCalendarEvents();
+    if (events && events.length > 0) {
+      localStorage.setItem('layerCalendarEvents', JSON.stringify(events));
     }
-  }, 5000);
+    
+    // Sync projects
+    const projects = await window.LayerDB.loadProjects();
+    if (projects && projects.length > 0) {
+      localStorage.setItem('layerProjectsData', JSON.stringify(projects));
+    }
+    
+    // Sync issues
+    const issues = await window.LayerDB.loadIssues();
+    if (issues && issues.length > 0) {
+      localStorage.setItem('layerMyIssues', JSON.stringify(issues));
+    }
+    
+    // Sync backlog tasks
+    const backlog = await window.LayerDB.loadBacklogTasks();
+    if (backlog && backlog.length > 0) {
+      localStorage.setItem('layerBacklogTasks', JSON.stringify(backlog));
+    }
+    
+    // Sync docs
+    const docs = await window.LayerDB.loadDocs();
+    if (docs && docs.length > 0) {
+      localStorage.setItem('layerDocs', JSON.stringify(docs));
+    }
+    
+    // Sync excels
+    const excels = await window.LayerDB.loadExcels();
+    if (excels && excels.length > 0) {
+      localStorage.setItem('layerExcels', JSON.stringify(excels));
+    }
+    
+    // Sync spaces
+    const spaces = await window.LayerDB.loadSpaces();
+    if (spaces && spaces.length > 0) {
+      localStorage.setItem('layerSpaces', JSON.stringify(spaces));
+    }
+    
+    console.log('Data sync complete!');
+  } catch (err) {
+    console.error('Failed to sync data from Supabase:', err);
+  }
 }
 
 
