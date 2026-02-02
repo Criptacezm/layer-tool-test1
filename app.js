@@ -26,25 +26,25 @@ const themeToggle = document.getElementById('themeToggle');
 // Initialization
 // ============================================
 function init() {
-  // Show loading screen for 2 seconds then reveal app
+  // Short, smooth loading screen - 0.8s animation + 0.4s fade
   const loadingScreen = document.getElementById('loadingScreen');
   const appContainer = document.getElementById('app');
   
   setTimeout(() => {
     loadingScreen.classList.add('fade-out');
     appContainer.style.opacity = '1';
-    appContainer.style.transition = 'opacity 0.6s cubic-bezier(0.4, 0, 0.2, 1)';
+    appContainer.style.transition = 'opacity 0.4s cubic-bezier(0.4, 0, 0.2, 1)';
     
-    // Remove loading screen from DOM after animation
+    // Remove loading screen from DOM after fade
     setTimeout(() => {
       loadingScreen.remove();
-    }, 600);
+    }, 400);
     
-    // Show beta notification popup after 1 second
+    // Show beta notification popup after short delay
     setTimeout(() => {
       showBetaNotification();
-    }, 1000);
-  }, 2000);
+    }, 500);
+  }, 900);
 
   // Load theme with mode support
   initTheme();
@@ -57,7 +57,9 @@ function init() {
 
   // Set up sidebar collapse
   setupSidebarCollapse();
-
+  
+  // Initialize sidebar sections (collapsible)
+  initSidebarSections();
   // Set up search
   setupSearch();
   
@@ -75,6 +77,9 @@ function init() {
 
   // Render initial view
   renderCurrentView();
+  
+  // Initialize AI icon morphing animation
+  initAIIconMorph();
 }
 
 // ============================================
@@ -144,6 +149,71 @@ function closeBetaNotification() {
 }
 
 // ============================================
+// AI Icon Animation (Glasses with gradient)
+// ============================================
+function initAIIconMorph() {
+  // Gradient animation is handled via SVG animate elements
+  // No JavaScript needed - the gradient loops automatically
+}
+
+// ============================================
+// Sidebar Section Toggle (Collapsible Sections)
+// ============================================
+function toggleNavSection(sectionName) {
+  const section = document.querySelector(`.nav-section-collapsible[data-section="${sectionName}"]`);
+  if (section) {
+    section.classList.toggle('collapsed');
+    // Save state to localStorage
+    const collapsedSections = JSON.parse(localStorage.getItem('layerCollapsedSections') || '{}');
+    collapsedSections[sectionName] = section.classList.contains('collapsed');
+    localStorage.setItem('layerCollapsedSections', JSON.stringify(collapsedSections));
+  }
+}
+
+function toggleTeamSection(teamName) {
+  const teamItem = document.querySelector(`.nav-team-item[data-team="${teamName}"]`);
+  if (teamItem) {
+    teamItem.classList.toggle('collapsed');
+    const content = teamItem.querySelector('.nav-team-content');
+    if (content) {
+      content.classList.toggle('open');
+    }
+    // Save state
+    const collapsedTeams = JSON.parse(localStorage.getItem('layerCollapsedTeams') || '{}');
+    collapsedTeams[teamName] = teamItem.classList.contains('collapsed');
+    localStorage.setItem('layerCollapsedTeams', JSON.stringify(collapsedTeams));
+  }
+}
+
+function initSidebarSections() {
+  // Load collapsed sections state
+  const collapsedSections = JSON.parse(localStorage.getItem('layerCollapsedSections') || '{}');
+  Object.keys(collapsedSections).forEach(sectionName => {
+    if (collapsedSections[sectionName]) {
+      const section = document.querySelector(`.nav-section-collapsible[data-section="${sectionName}"]`);
+      if (section) {
+        section.classList.add('collapsed');
+      }
+    }
+  });
+  
+  // Load collapsed teams state
+  const collapsedTeams = JSON.parse(localStorage.getItem('layerCollapsedTeams') || '{}');
+  Object.keys(collapsedTeams).forEach(teamName => {
+    if (collapsedTeams[teamName]) {
+      const teamItem = document.querySelector(`.nav-team-item[data-team="${teamName}"]`);
+      if (teamItem) {
+        teamItem.classList.add('collapsed');
+        const content = teamItem.querySelector('.nav-team-content');
+        if (content) {
+          content.classList.remove('open');
+        }
+      }
+    }
+  });
+}
+
+// ============================================
 // Sidebar Collapse
 // ============================================
 function setupSidebarCollapse() {
@@ -162,6 +232,30 @@ function setupSidebarCollapse() {
       const collapsed = sidebar.classList.contains('collapsed');
       localStorage.setItem('layerSidebarCollapsed', collapsed);
     });
+  }
+  
+  // Initialize workspace section state
+  initWorkspaceSection();
+}
+
+// ============================================
+// Workspace Section Toggle
+// ============================================
+function initWorkspaceSection() {
+  // Always start expanded by default
+  const workspaceSection = document.getElementById('workspaceSection');
+  if (workspaceSection) {
+    workspaceSection.classList.add('expanded');
+  }
+}
+
+function toggleWorkspaceSection(event) {
+  if (event) event.stopPropagation();
+  
+  const workspaceSection = document.getElementById('workspaceSection');
+  
+  if (workspaceSection) {
+    workspaceSection.classList.toggle('expanded');
   }
 }
 
@@ -234,17 +328,21 @@ function setupMobileNavigation() {
 }
 
 function updateBreadcrumb(text) {
-  breadcrumbText.textContent = text;
+  if (breadcrumbText) {
+    breadcrumbText.textContent = text;
+  }
 }
 
 // ============================================
 // Search
 // ============================================
 function setupSearch() {
-  searchInput.addEventListener('input', (e) => {
-    searchQuery = e.target.value;
-    renderCurrentView();
-  });
+  if (searchInput) {
+    searchInput.addEventListener('input', (e) => {
+      searchQuery = e.target.value;
+      renderCurrentView();
+    });
+  }
 }
 
 // ============================================
@@ -438,79 +536,94 @@ function switchAuthMode(mode) {
   renderAuthModal();
 }
 
-function handleAuthSubmit(event) {
+async function handleAuthSubmit(event) {
   event.preventDefault();
   
   const email = document.getElementById('authEmail').value.trim();
   const password = document.getElementById('authPassword').value;
   const errorEl = document.getElementById('authError');
+  const submitBtn = event.target.querySelector('button[type="submit"]');
   
   // Clear previous errors
   errorEl.style.display = 'none';
   
-  if (authMode === 'signup') {
-    const username = document.getElementById('authUsername').value.trim();
-    const confirmPassword = document.getElementById('authConfirmPassword').value;
-    
-    // Validation
-    if (!email || !username || !password || !confirmPassword) {
-      showAuthError('Please fill in all fields');
-      return;
+  // Disable submit button
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = authMode === 'signin' ? 'Signing in...' : 'Creating account...';
+  }
+  
+  try {
+    if (authMode === 'signup') {
+      const username = document.getElementById('authUsername').value.trim();
+      const confirmPassword = document.getElementById('authConfirmPassword').value;
+      
+      // Validation
+      if (!email || !username || !password || !confirmPassword) {
+        showAuthError('Please fill in all fields');
+        return;
+      }
+      
+      if (password !== confirmPassword) {
+        showAuthError('Passwords do not match');
+        return;
+      }
+      
+      if (password.length < 6) {
+        showAuthError('Password must be at least 6 characters');
+        return;
+      }
+      
+      // Use Supabase signUp
+      const { user, session } = await window.LayerDB.signUp(email, password, username);
+      
+      closeModal();
+      
+      if (session) {
+        // Immediately signed in
+        updateUserDisplay({ username, email });
+        showToast('Account created successfully!', 'success');
+        
+        // Migrate local data to Supabase
+        await window.LayerDB.migrateLocalDataToSupabase();
+        renderCurrentView();
+      } else {
+        // Email confirmation required
+        showToast('Please check your email to confirm your account', 'info');
+      }
+      
+    } else {
+      // Sign In
+      if (!email || !password) {
+        showAuthError('Please enter your email and password');
+        return;
+      }
+      
+      // Use Supabase signIn
+      const { user, session } = await window.LayerDB.signIn(email, password);
+      
+      // Get profile for username
+      const profile = await window.LayerDB.getProfile();
+      
+      closeModal();
+      updateUserDisplay({ 
+        username: profile?.username || email.split('@')[0], 
+        email 
+      });
+      showToast('Signed in successfully!', 'success');
+      
+      // Reload views with Supabase data
+      renderCurrentView();
     }
-    
-    if (password !== confirmPassword) {
-      showAuthError('Passwords do not match');
-      return;
+  } catch (error) {
+    console.error('Auth error:', error);
+    showAuthError(error.message || 'An error occurred. Please try again.');
+  } finally {
+    // Re-enable submit button
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = authMode === 'signin' ? 'Sign In' : 'Create Account';
     }
-    
-    if (password.length < 6) {
-      showAuthError('Password must be at least 6 characters');
-      return;
-    }
-    
-    // Store user data (localStorage simulation)
-    const users = JSON.parse(localStorage.getItem('layerUsers') || '[]');
-    
-    // Check if email already exists
-    if (users.find(u => u.email === email)) {
-      showAuthError('An account with this email already exists');
-      return;
-    }
-    
-    // Add new user
-    const newUser = {
-      id: Date.now().toString(),
-      email,
-      username,
-      password, // Note: In production, never store plain passwords
-      createdAt: new Date().toISOString()
-    };
-    
-    users.push(newUser);
-    localStorage.setItem('layerUsers', JSON.stringify(users));
-    localStorage.setItem('layerCurrentUser', JSON.stringify(newUser));
-    
-    closeModal();
-    updateUserDisplay(newUser);
-    
-  } else {
-    // Sign In
-    if (!email || !password) {
-      showAuthError('Please enter your email and password');
-      return;
-    }
-    
-    const users = JSON.parse(localStorage.getItem('layerUsers') || '[]');
-    const user = users.find(u => u.email === email && u.password === password);
-    
-    if (!user) {
-      showAuthError('Invalid email or password');
-      return;
-    }
-    
-    localStorage.setItem('layerCurrentUser', JSON.stringify(user));
-    closeModal();
-    updateUserDisplay(user);
   }
 }
 
@@ -523,12 +636,12 @@ function showAuthError(message) {
 function updateUserDisplay(user) {
   const signInBtn = document.getElementById('signInBtn');
   if (signInBtn && user) {
-    const initials = user.username.slice(0, 2).toUpperCase();
+    const initials = (user.username || user.email || 'U').slice(0, 2).toUpperCase();
     signInBtn.outerHTML = `
       <div class="user-info" id="userInfo">
         <div class="user-avatar">${initials}</div>
-        <span class="user-name">${user.username}</span>
-        <button class="sign-out-btn" onclick="signOut()" title="Sign Out">
+        <span class="user-name">${user.username || user.email}</span>
+        <button class="sign-out-btn" onclick="handleSignOut()" title="Sign Out">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
             <polyline points="16 17 21 12 16 7"/>
@@ -540,35 +653,143 @@ function updateUserDisplay(user) {
   }
 }
 
-function signOut() {
-  localStorage.removeItem('layerCurrentUser');
-  const userInfo = document.getElementById('userInfo');
-  if (userInfo) {
-    userInfo.outerHTML = `
-      <button class="sign-in-btn" id="signInBtn" onclick="openAuthModal()">
-        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
-          <polyline points="10 17 15 12 10 7"/>
-          <line x1="15" y1="12" x2="3" y2="12"/>
-        </svg>
-        <span>Sign In</span>
-      </button>
-    `;
+async function handleSignOut() {
+  try {
+    await window.LayerDB.signOut();
+    
+    const userInfo = document.getElementById('userInfo');
+    if (userInfo) {
+      userInfo.outerHTML = `
+        <button class="sign-in-btn" id="signInBtn" onclick="openAuthModal()">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+            <polyline points="10 17 15 12 10 7"/>
+            <line x1="15" y1="12" x2="3" y2="12"/>
+          </svg>
+          <span>Sign In</span>
+        </button>
+      `;
+    }
+    
+    showToast('Signed out successfully', 'success');
+    renderCurrentView();
+  } catch (error) {
+    console.error('Sign out error:', error);
+    showToast('Failed to sign out', 'error');
   }
 }
 
-function checkExistingSession() {
-  const currentUser = localStorage.getItem('layerCurrentUser');
-  if (currentUser) {
-    updateUserDisplay(JSON.parse(currentUser));
+async function checkExistingSession() {
+  try {
+    // Initialize Supabase auth
+    const { user, session } = await window.LayerDB.initAuth();
+    
+    if (user && session) {
+      const profile = await window.LayerDB.getProfile();
+      updateUserDisplay({ 
+        username: profile?.username || user.email?.split('@')[0], 
+        email: user.email 
+      });
+    }
+    
+    // Listen for auth state changes
+    window.addEventListener('authStateChanged', async (e) => {
+      const { user, session, event } = e.detail;
+      
+      if (event === 'SIGNED_IN' && user) {
+        const profile = await window.LayerDB.getProfile();
+        updateUserDisplay({ 
+          username: profile?.username || user.email?.split('@')[0], 
+          email: user.email 
+        });
+        renderCurrentView();
+      } else if (event === 'SIGNED_OUT') {
+        const userInfo = document.getElementById('userInfo');
+        if (userInfo) {
+          userInfo.outerHTML = `
+            <button class="sign-in-btn" id="signInBtn" onclick="openAuthModal()">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+                <polyline points="10 17 15 12 10 7"/>
+                <line x1="15" y1="12" x2="3" y2="12"/>
+              </svg>
+              <span>Sign In</span>
+            </button>
+          `;
+        }
+        renderCurrentView();
+      }
+    });
+  } catch (error) {
+    console.error('Session check error:', error);
   }
+}
+
+// Toast notification helper
+function showToast(message, type = 'info') {
+  const toast = document.createElement('div');
+  toast.className = `toast toast-${type}`;
+  toast.innerHTML = `
+    <span>${message}</span>
+    <button onclick="this.parentElement.remove()">×</button>
+  `;
+  
+  // Add toast container if not exists
+  let container = document.getElementById('toastContainer');
+  if (!container) {
+    container = document.createElement('div');
+    container.id = 'toastContainer';
+    container.className = 'toast-container';
+    document.body.appendChild(container);
+  }
+  
+  container.appendChild(toast);
+  
+  // Auto-remove after 5 seconds
+  setTimeout(() => {
+    if (toast.parentElement) {
+      toast.remove();
+    }
+  }, 5000);
 }
 
 
 // ============================================
 // View Rendering
 // ============================================
-function renderCurrentView() {
+
+// Store scroll position for schedule view
+let scheduleScrollPosition = { x: 0, y: 0 };
+
+// Save current schedule scroll position
+function saveScheduleScrollPosition() {
+  const scrollContainer = document.querySelector('.week-grid-scroll, .day-view-grid-scroll');
+  if (scrollContainer) {
+    scheduleScrollPosition = {
+      x: scrollContainer.scrollLeft,
+      y: scrollContainer.scrollTop
+    };
+  }
+}
+
+// Restore schedule scroll position after render
+function restoreScheduleScrollPosition() {
+  requestAnimationFrame(() => {
+    const scrollContainer = document.querySelector('.week-grid-scroll, .day-view-grid-scroll');
+    if (scrollContainer && (scheduleScrollPosition.x > 0 || scheduleScrollPosition.y > 0)) {
+      scrollContainer.scrollLeft = scheduleScrollPosition.x;
+      scrollContainer.scrollTop = scheduleScrollPosition.y;
+    }
+  });
+}
+
+// Render current view with optional scroll preservation
+function renderCurrentView(preserveScroll = false) {
+  // Save scroll position if we're on schedule view and preserving scroll
+  if (preserveScroll && currentView === 'schedule') {
+    saveScheduleScrollPosition();
+  }
+  
   if (selectedProjectIndex !== null) {
     viewsContainer.innerHTML = renderProjectDetailView(selectedProjectIndex);
     updateBreadcrumb('Project Details');
@@ -597,19 +818,55 @@ function renderCurrentView() {
     case 'schedule':                          // ← Add this case
       viewsContainer.innerHTML = renderScheduleView();
       updateBreadcrumb('Schedule');
+      // Initialize current time indicator
+      if (typeof initCurrentTimeIndicator === 'function') {
+        initCurrentTimeIndicator();
+      }
+      // Restore scroll position if preserving
+      if (preserveScroll) {
+        restoreScheduleScrollPosition();
+      }
       break;
     case 'activity':
       viewsContainer.innerHTML = renderActivityView(searchQuery);
-      updateBreadcrumb('Activity');
+      updateBreadcrumb('Projects');
       break;
     case 'team':
       viewsContainer.innerHTML = renderTeamView();
       updateBreadcrumb('Team');
       break;
+    case 'ai':
+      viewsContainer.innerHTML = renderAIView();
+      updateBreadcrumb('AI');
+      break;
     default:
       viewsContainer.innerHTML = renderMyIssuesView();
       updateBreadcrumb('My issues');
   }
+  
+  // Restore saved left panel width
+  const savedWidth = loadLeftPanelWidth();
+  if (savedWidth) {
+    document.querySelectorAll('.tl-left-panel-clickup').forEach(panel => {
+      panel.style.width = savedWidth + 'px';
+    });
+  }
+  
+  // Setup resize observer for left panels
+  setTimeout(() => {
+    document.querySelectorAll('.tl-left-panel-clickup').forEach(panel => {
+      if (!panel.dataset.resizeObserved) {
+        panel.dataset.resizeObserved = 'true';
+        const observer = new ResizeObserver(entries => {
+          for (const entry of entries) {
+            const width = Math.round(entry.contentRect.width);
+            if (width > 0) saveLeftPanelWidth(width);
+          }
+        });
+        observer.observe(panel);
+      }
+    });
+  }, 100);
 }
 
 function setupIssueFilterListeners() {
@@ -757,17 +1014,64 @@ function handleUpdateProjectDescription(index, description) {
 // ============================================
 // Project Task Handlers
 // ============================================
-function handleToggleProjectTask(projectIndex, columnIndex, taskIndex) {
+function handleToggleProjectTask(projectIndex, columnIndex, taskIndex, event) {
+  // Prevent event bubbling that could trigger tab switches or other handlers
+  if (event) {
+    event.stopPropagation();
+  }
+  
+  // Save the current active tab before re-render
+  const activeTab = document.querySelector('.pd-tab.active');
+  const currentTabName = activeTab ? activeTab.dataset.tab : 'overview';
+  
   toggleTaskDone(projectIndex, columnIndex, taskIndex);
   renderCurrentView();
+  
+  // Restore the active tab if we're in project detail view and timeline was active
+  if (currentTabName === 'timeline' && typeof switchProjectTab === 'function') {
+    requestAnimationFrame(() => {
+      switchProjectTab('timeline', projectIndex);
+    });
+  }
 }
 
-function handleDeleteProjectTask(projectIndex, columnIndex, taskIndex) {
-  deleteTask(projectIndex, columnIndex, taskIndex);
-  renderCurrentView();
+function handleDeleteProjectTask(projectIndex, columnIndex, taskIndex, event) {
+  // Prevent event bubbling that could trigger tab switches
+  if (event) {
+    event.stopPropagation();
+  }
+  
+  // Save the current active tab before re-render
+  const activeTab = document.querySelector('.pd-tab.active');
+  const currentTabName = activeTab ? activeTab.dataset.tab : 'overview';
+  
+  if (confirm('Delete this task?')) {
+    const projects = loadProjects();
+    if (projects[projectIndex]?.columns[columnIndex]?.tasks[taskIndex]) {
+      projects[projectIndex].columns[columnIndex].tasks.splice(taskIndex, 1);
+      saveProjects(projects);
+    }
+    renderCurrentView();
+    
+    // Restore the active tab if we're in project detail view and timeline was active
+    if (currentTabName === 'timeline' && typeof switchProjectTab === 'function') {
+      requestAnimationFrame(() => {
+        switchProjectTab('timeline', projectIndex);
+      });
+    }
+  }
 }
 
 function handleAddProjectTaskKeypress(event, projectIndex, columnIndex) {
+  // Prevent event bubbling that could trigger tab switches
+  if (event) {
+    event.stopPropagation();
+  }
+  
+  // Save the current active tab before re-render
+  const activeTab = document.querySelector('.pd-tab.active');
+  const currentTabName = activeTab ? activeTab.dataset.tab : 'overview';
+  
   if (event.key === 'Enter') {
     const input = event.target;
     const title = input.value.trim();
@@ -775,6 +1079,38 @@ function handleAddProjectTaskKeypress(event, projectIndex, columnIndex) {
       addTaskToColumn(projectIndex, columnIndex, title);
       input.value = '';
       renderCurrentView();
+      
+      // Restore the active tab if we're in project detail view and timeline was active
+      if (currentTabName === 'timeline' && typeof switchProjectTab === 'function') {
+        requestAnimationFrame(() => {
+          switchProjectTab('timeline', projectIndex);
+        });
+      }
+    }
+  }
+}
+
+function handleAddTaskToColumn(projectIndex, columnIndex, event) {
+  // Prevent event bubbling that could trigger tab switches
+  if (event) {
+    event.stopPropagation();
+  }
+  
+  // Save the current active tab before re-render
+  const activeTab = document.querySelector('.pd-tab.active');
+  const currentTabName = activeTab ? activeTab.dataset.tab : 'overview';
+  
+  // Prompt user for task title
+  const title = prompt('Enter task title:');
+  if (title && title.trim()) {
+    addTaskToColumn(projectIndex, columnIndex, title.trim());
+    renderCurrentView();
+    
+    // Restore the active tab if we're in project detail view and timeline was active
+    if (currentTabName === 'timeline' && typeof switchProjectTab === 'function') {
+      requestAnimationFrame(() => {
+        switchProjectTab('timeline', projectIndex);
+      });
     }
   }
 }
@@ -793,46 +1129,7 @@ document.addEventListener('DOMContentLoaded', init);
 // View Renderers
 // ============================================
 
-function renderInboxView() {
-  const projects = loadProjects();
-  const activity = getRecentActivity(projects);
-
-  if (activity.length === 0) {
-    return `
-      <div class="inbox-container">
-        <div class="empty-state">
-          <div class="empty-state-icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;color:var(--muted-foreground);">
-              <path d="M22 12h-6l-2 3h-4l-2-3H2"/>
-              <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>
-            </svg>
-          </div>
-          <h3 class="empty-state-title">No recent activity</h3>
-          <p class="empty-state-text">Activity from your projects will appear here</p>
-        </div>
-      </div>
-    `;
-  }
-
-  return `
-    <div class="inbox-container">
-      <h2 class="view-title" style="margin-bottom: 24px;">Recent Activity</h2>
-      <div class="activity-list">
-        ${activity.map(item => `
-        <div class="activity-item">
-            <div class="activity-icon">
-                <i class="fa fa-cube"></i>
-            </div>
-            <div class="activity-content">
-                <div class="activity-message">${item.message}</div>
-                <div class="activity-time">${formatTimeAgo(item.time)}</div>
-            </div>
-        </div>
-        `).join('')}
-      </div>
-    </div>
-  `;
-}
+// Note: renderInboxView is defined in functionality.js with the full dashboard
 
 function renderMyIssuesView(filter = 'all', searchQuery = '') {
   let issues = loadIssues();
@@ -1207,13 +1504,13 @@ function renderProjectDetailView(projectIndex) {
                   ${column.tasks.map((task, taskIndex) => `
                     <div class="kanban-task ${task.done ? 'done' : ''}">
                       <label class="checkbox-container" style="width: 16px; height: 16px;">
-                        <input type="checkbox" ${task.done ? 'checked' : ''} onchange="handleToggleProjectTask(${projectIndex}, ${colIndex}, ${taskIndex})">
+                        <input type="checkbox" ${task.done ? 'checked' : ''} onchange="handleToggleProjectTask(${projectIndex}, ${colIndex}, ${taskIndex}, event)">
                         <div class="checkbox-custom" style="width: 16px; height: 16px; border-radius: 3px;">
                           <svg class="check-icon" style="width: 10px; height: 10px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M20 6L9 17l-5-5"/></svg>
                         </div>
                       </label>
                       <span class="kanban-task-title">${task.title}</span>
-                      <button class="kanban-task-delete" onclick="handleDeleteProjectTask(${projectIndex}, ${colIndex}, ${taskIndex})">
+                      <button class="kanban-task-delete" onclick="handleDeleteProjectTask(${projectIndex}, ${colIndex}, ${taskIndex}, event)">
                         <svg class="icon" style="width: 14px; height: 14px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
                       </button>
                     </div>

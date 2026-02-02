@@ -1,52 +1,59 @@
 /* ============================================
-   Layer - Data Store & Persistence with Supabase
+   Layer - Data Store & Persistence
    ============================================ */
 
-// Supabase Configuration
-const SUPABASE_URL = 'https://uqfnadlyrbprzxgjkvtc.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVxZm5hZGx5cmJwcnp4Z2prdnRjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjczNzkxNzAsImV4cCI6MjA4Mjk1NTE3MH0.12PfMd0vnsWvCXSNdkc3E02KDn46xi9XTyZ8rXNiVHs';
-
-// Local cache for data (to reduce API calls and enable offline functionality)
-let projectsCache = null;
-let issuesCache = null;
-let backlogTasksCache = null;
-let calendarEventsCache = null;
-let docsCache = null;
-let excelsCache = null;
-let spacesCache = null;
-let assignmentsCache = null;
-
-// Storage keys for fallback localStorage (offline mode)
+// Storage keys
 const PROJECTS_KEY = 'layerProjectsData';
 const BACKLOG_KEY = 'layerBacklogTasks';
 const ISSUES_KEY = 'layerMyIssues';
 const THEME_KEY = 'layerTheme';
-const ASSIGNMENTS_KEY = 'layerAssignments';
-const CALENDAR_KEY = 'layerCalendarEvents';
-const DOCS_KEY = 'layerDocs';
-const EXCELS_KEY = 'layerExcels';
-const SPACES_KEY = 'layerSpaces';
+const LEFT_PANEL_WIDTH_KEY = 'layerLeftPanelWidth';
 
-// Supabase client initialization
-let supabaseClient = null;
-
-async function getSupabaseClient() {
-  if (supabaseClient) return supabaseClient;
-  
+// ============================================
+// Left Panel Width Persistence
+// ============================================
+function saveLeftPanelWidth(width) {
   try {
-    const { createClient } = await import('https://esm.sh/@supabase/supabase-js@2');
-    supabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-    window.supabase = supabaseClient;
-    console.log('Supabase client initialized');
-    return supabaseClient;
-  } catch (error) {
-    console.error('Failed to initialize Supabase:', error);
+    localStorage.setItem(LEFT_PANEL_WIDTH_KEY, width.toString());
+  } catch (e) {
+    console.error('Failed to save left panel width:', e);
+  }
+}
+
+function loadLeftPanelWidth() {
+  try {
+    const width = localStorage.getItem(LEFT_PANEL_WIDTH_KEY);
+    return width ? parseInt(width, 10) : null;
+  } catch (e) {
+    console.error('Failed to load left panel width:', e);
     return null;
   }
 }
 
-// Initialize Supabase on load
-getSupabaseClient();
+function initLeftPanelResize() {
+  const savedWidth = loadLeftPanelWidth();
+  if (savedWidth) {
+    document.querySelectorAll('.tl-left-panel-clickup').forEach(panel => {
+      panel.style.width = savedWidth + 'px';
+    });
+  }
+  
+  // Use ResizeObserver to detect manual resizing
+  const observer = new ResizeObserver(entries => {
+    for (const entry of entries) {
+      if (entry.target.classList.contains('tl-left-panel-clickup')) {
+        const width = Math.round(entry.contentRect.width);
+        saveLeftPanelWidth(width);
+      }
+    }
+  });
+  
+  // Observe all left panels
+  document.querySelectorAll('.tl-left-panel-clickup').forEach(panel => {
+    observer.observe(panel);
+  });
+}
+
 
 // ============================================
 // ID Generation
@@ -60,51 +67,18 @@ function generateIssueId() {
 }
 
 // ============================================
-// Projects - Supabase with localStorage fallback
+// Projects
 // ============================================
-async function loadProjectsAsync() {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      const { data, error } = await supabase
-        .from('projects')
-        .select('*')
-        .order('created_at', { ascending: false });
-      
-      if (error) throw error;
-      
-      // Transform and cache
-      projectsCache = (data || []).map(project => ({
-        ...project,
-        columns: project.columns || [
-          { title: 'To Do', tasks: [] },
-          { title: 'In Progress', tasks: [] },
-          { title: 'Done', tasks: [] },
-        ],
-        flowchart: project.flowchart || { nodes: [], edges: [] },
-        updates: project.updates || []
-      }));
-      
-      // Also save to localStorage as backup
-      localStorage.setItem(PROJECTS_KEY, JSON.stringify(projectsCache));
-      return projectsCache;
-    }
-  } catch (error) {
-    console.error('Supabase error loading projects:', error);
-  }
-  
-  // Fallback to localStorage
-  return loadProjectsFromLocalStorage();
-}
-
-function loadProjectsFromLocalStorage() {
+function loadProjects() {
   try {
     const data = localStorage.getItem(PROJECTS_KEY);
     if (data) {
       const projects = JSON.parse(data);
       return projects.map(project => {
+        // Migration: ensure flowchart exists
         if (!project.flowchart) {
           project.flowchart = { nodes: [], edges: [] };
+          // Optional: migrate old description to a text node
           if (project.description && project.description.trim()) {
             project.flowchart.nodes.push({
               id: 'migrated-text',
@@ -123,60 +97,17 @@ function loadProjectsFromLocalStorage() {
       });
     }
   } catch (e) {
-    console.error('Failed to load projects from localStorage:', e);
+    console.error('Failed to load projects:', e);
   }
   return [];
 }
 
-// Sync function - loads from cache if available, otherwise from Supabase/localStorage
-function loadProjects() {
-  if (projectsCache !== null) {
-    return projectsCache;
-  }
-  // Load from localStorage first (sync), then trigger async update
-  projectsCache = loadProjectsFromLocalStorage();
-  loadProjectsAsync().then(data => {
-    projectsCache = data;
-  });
-  return projectsCache;
-}
-
-async function saveProjectsAsync(projects) {
-  projectsCache = projects;
-  localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects));
-  
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      // Upsert all projects
-      for (const project of projects) {
-        const { error } = await supabase
-          .from('projects')
-          .upsert({
-            id: project.id,
-            name: project.name,
-            status: project.status,
-            start_date: project.startDate,
-            target_date: project.targetDate,
-            description: project.description,
-            columns: project.columns,
-            flowchart: project.flowchart,
-            updates: project.updates,
-            linked_space_id: project.linkedSpaceId
-          }, { onConflict: 'id' });
-        
-        if (error) console.error('Error saving project:', error);
-      }
-    }
-  } catch (error) {
-    console.error('Supabase error saving projects:', error);
-  }
-}
-
 function saveProjects(projects) {
-  projectsCache = projects;
-  localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects));
-  saveProjectsAsync(projects);
+  try {
+    localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects));
+  } catch (e) {
+    console.error('Failed to save projects:', e);
+  }
 }
 
 function addProject(projectData) {
@@ -215,30 +146,10 @@ function updateProject(index, updates) {
   return projects;
 }
 
-async function deleteProjectAsync(projectId) {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      const { error } = await supabase
-        .from('projects')
-        .delete()
-        .eq('id', projectId);
-      
-      if (error) console.error('Error deleting project from Supabase:', error);
-    }
-  } catch (error) {
-    console.error('Supabase error deleting project:', error);
-  }
-}
-
 function deleteProject(index) {
   const projects = loadProjects();
-  const deletedProject = projects[index];
   projects.splice(index, 1);
   saveProjects(projects);
-  if (deletedProject) {
-    deleteProjectAsync(deletedProject.id);
-  }
   return projects;
 }
 
@@ -314,79 +225,34 @@ function renameColumn(projectIndex, columnIndex, newTitle) {
 // ============================================
 // Backlog Tasks
 // ============================================
-async function loadBacklogTasksAsync() {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      const { data, error } = await supabase
-        .from('backlog_tasks')
-        .select('*')
-        .order('created_at', { ascending: false });
-      
-      if (error) throw error;
-      backlogTasksCache = data || [];
-      localStorage.setItem(BACKLOG_KEY, JSON.stringify(backlogTasksCache));
-      return backlogTasksCache;
-    }
-  } catch (error) {
-    console.error('Supabase error loading backlog tasks:', error);
-  }
-  return loadBacklogTasksFromLocalStorage();
-}
-
-function loadBacklogTasksFromLocalStorage() {
+function loadBacklogTasks() {
   try {
     const data = localStorage.getItem(BACKLOG_KEY);
-    if (data) return JSON.parse(data);
+    if (data) {
+      return JSON.parse(data);
+    }
   } catch (e) {
     console.error('Failed to load backlog tasks:', e);
   }
   return [];
 }
 
-function loadBacklogTasks() {
-  if (backlogTasksCache !== null) return backlogTasksCache;
-  backlogTasksCache = loadBacklogTasksFromLocalStorage();
-  loadBacklogTasksAsync().then(data => { backlogTasksCache = data; });
-  return backlogTasksCache;
-}
-
-async function saveBacklogTasksAsync(tasks) {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      for (const task of tasks) {
-        const { error } = await supabase
-          .from('backlog_tasks')
-          .upsert({
-            id: task.id,
-            title: task.title,
-            done: task.done,
-            created_at: task.createdAt
-          }, { onConflict: 'id' });
-        if (error) console.error('Error saving backlog task:', error);
-      }
-    }
-  } catch (error) {
-    console.error('Supabase error saving backlog tasks:', error);
-  }
-}
-
 function saveBacklogTasks(tasks) {
-  backlogTasksCache = tasks;
-  localStorage.setItem(BACKLOG_KEY, JSON.stringify(tasks));
-  saveBacklogTasksAsync(tasks);
+  try {
+    localStorage.setItem(BACKLOG_KEY, JSON.stringify(tasks));
+  } catch (e) {
+    console.error('Failed to save backlog tasks:', e);
+  }
 }
 
 function addBacklogTask(title) {
   const tasks = loadBacklogTasks();
-  const newTask = {
+  tasks.push({
     id: generateId('BACKLOG'),
     title: title,
     done: false,
     createdAt: new Date().toISOString()
-  };
-  tasks.push(newTask);
+  });
   saveBacklogTasks(tasks);
   return tasks;
 }
@@ -409,99 +275,35 @@ function updateBacklogTask(index, title) {
   return tasks;
 }
 
-async function deleteBacklogTaskAsync(taskId) {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      const { error } = await supabase
-        .from('backlog_tasks')
-        .delete()
-        .eq('id', taskId);
-      if (error) console.error('Error deleting backlog task:', error);
-    }
-  } catch (error) {
-    console.error('Supabase error deleting backlog task:', error);
-  }
-}
-
 function deleteBacklogTask(index) {
   const tasks = loadBacklogTasks();
-  const deleted = tasks[index];
   tasks.splice(index, 1);
   saveBacklogTasks(tasks);
-  if (deleted) deleteBacklogTaskAsync(deleted.id);
   return tasks;
 }
 
 // ============================================
 // Issues
 // ============================================
-async function loadIssuesAsync() {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      const { data, error } = await supabase
-        .from('issues')
-        .select('*')
-        .order('created_at', { ascending: false });
-      
-      if (error) throw error;
-      issuesCache = data || [];
-      localStorage.setItem(ISSUES_KEY, JSON.stringify(issuesCache));
-      return issuesCache;
-    }
-  } catch (error) {
-    console.error('Supabase error loading issues:', error);
-  }
-  return loadIssuesFromLocalStorage();
-}
-
-function loadIssuesFromLocalStorage() {
+function loadIssues() {
   try {
     const data = localStorage.getItem(ISSUES_KEY);
-    if (data) return JSON.parse(data);
+    if (data) {
+      return JSON.parse(data);
+    }
   } catch (e) {
     console.error('Failed to load issues:', e);
   }
+  // Return empty array for fresh start
   return [];
 }
 
-function loadIssues() {
-  if (issuesCache !== null) return issuesCache;
-  issuesCache = loadIssuesFromLocalStorage();
-  loadIssuesAsync().then(data => { issuesCache = data; });
-  return issuesCache;
-}
-
-async function saveIssuesAsync(issues) {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      for (const issue of issues) {
-        const { error } = await supabase
-          .from('issues')
-          .upsert({
-            id: issue.id,
-            title: issue.title,
-            description: issue.description,
-            status: issue.status,
-            priority: issue.priority,
-            assignee: issue.assignee,
-            due_date: issue.dueDate,
-            updated: issue.updated
-          }, { onConflict: 'id' });
-        if (error) console.error('Error saving issue:', error);
-      }
-    }
-  } catch (error) {
-    console.error('Supabase error saving issues:', error);
-  }
-}
-
 function saveIssues(issues) {
-  issuesCache = issues;
-  localStorage.setItem(ISSUES_KEY, JSON.stringify(issues));
-  saveIssuesAsync(issues);
+  try {
+    localStorage.setItem(ISSUES_KEY, JSON.stringify(issues));
+  } catch (e) {
+    console.error('Failed to save issues:', e);
+  }
 }
 
 function addIssue(issueData) {
@@ -522,460 +324,6 @@ function addIssue(issueData) {
 }
 
 // ============================================
-// Calendar Events
-// ============================================
-async function loadCalendarEventsAsync() {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      const { data, error } = await supabase
-        .from('calendar_events')
-        .select('*')
-        .order('date', { ascending: true });
-      
-      if (error) throw error;
-      calendarEventsCache = data || [];
-      localStorage.setItem(CALENDAR_KEY, JSON.stringify(calendarEventsCache));
-      return calendarEventsCache;
-    }
-  } catch (error) {
-    console.error('Supabase error loading calendar events:', error);
-  }
-  return loadCalendarEventsFromLocalStorage();
-}
-
-function loadCalendarEventsFromLocalStorage() {
-  try {
-    const data = localStorage.getItem(CALENDAR_KEY);
-    if (data) return JSON.parse(data);
-  } catch (e) {
-    console.error('Failed to load calendar events:', e);
-  }
-  return [];
-}
-
-function loadCalendarEvents() {
-  if (calendarEventsCache !== null) return calendarEventsCache;
-  calendarEventsCache = loadCalendarEventsFromLocalStorage();
-  loadCalendarEventsAsync().then(data => { calendarEventsCache = data; });
-  return calendarEventsCache;
-}
-
-async function saveCalendarEventsAsync(events) {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      for (const event of events) {
-        const { error } = await supabase
-          .from('calendar_events')
-          .upsert({
-            id: event.id,
-            title: event.title,
-            date: event.date,
-            time: event.time,
-            color: event.color,
-            completed: event.completed,
-            description: event.description
-          }, { onConflict: 'id' });
-        if (error) console.error('Error saving calendar event:', error);
-      }
-    }
-  } catch (error) {
-    console.error('Supabase error saving calendar events:', error);
-  }
-}
-
-function saveCalendarEvents(events) {
-  calendarEventsCache = events;
-  localStorage.setItem(CALENDAR_KEY, JSON.stringify(events));
-  saveCalendarEventsAsync(events);
-}
-
-function addCalendarEvent(eventData) {
-  const events = loadCalendarEvents();
-  const newEvent = {
-    id: generateId('EVENT'),
-    title: eventData.title,
-    date: eventData.date,
-    time: eventData.time || null,
-    color: eventData.color || 'blue',
-    completed: false,
-    description: eventData.description || ''
-  };
-  events.push(newEvent);
-  saveCalendarEvents(events);
-  return events;
-}
-
-function updateCalendarEvent(eventId, updates) {
-  const events = loadCalendarEvents();
-  const index = events.findIndex(e => e.id === eventId);
-  if (index !== -1) {
-    events[index] = { ...events[index], ...updates };
-    saveCalendarEvents(events);
-  }
-  return events;
-}
-
-async function deleteCalendarEventAsync(eventId) {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      const { error } = await supabase
-        .from('calendar_events')
-        .delete()
-        .eq('id', eventId);
-      if (error) console.error('Error deleting calendar event:', error);
-    }
-  } catch (error) {
-    console.error('Supabase error deleting calendar event:', error);
-  }
-}
-
-function deleteCalendarEvent(eventId) {
-  const events = loadCalendarEvents();
-  const index = events.findIndex(e => e.id === eventId);
-  if (index !== -1) {
-    events.splice(index, 1);
-    saveCalendarEvents(events);
-    deleteCalendarEventAsync(eventId);
-  }
-  return events;
-}
-
-// ============================================
-// Documents
-// ============================================
-async function loadDocsAsync() {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      const { data, error } = await supabase
-        .from('documents')
-        .select('*')
-        .order('updated_at', { ascending: false });
-      
-      if (error) throw error;
-      docsCache = data || [];
-      localStorage.setItem(DOCS_KEY, JSON.stringify(docsCache));
-      return docsCache;
-    }
-  } catch (error) {
-    console.error('Supabase error loading docs:', error);
-  }
-  return loadDocsFromLocalStorage();
-}
-
-function loadDocsFromLocalStorage() {
-  try {
-    const data = localStorage.getItem(DOCS_KEY);
-    if (data) return JSON.parse(data);
-  } catch (e) {
-    console.error('Failed to load docs:', e);
-  }
-  return [];
-}
-
-function loadDocs() {
-  if (docsCache !== null) return docsCache;
-  docsCache = loadDocsFromLocalStorage();
-  loadDocsAsync().then(data => { docsCache = data; });
-  return docsCache;
-}
-
-async function saveDocsAsync(docs) {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      for (const doc of docs) {
-        const { error } = await supabase
-          .from('documents')
-          .upsert({
-            id: doc.id,
-            title: doc.title,
-            content: doc.content,
-            space_id: doc.spaceId,
-            project_id: doc.projectId,
-            created_at: doc.createdAt,
-            updated_at: doc.updatedAt
-          }, { onConflict: 'id' });
-        if (error) console.error('Error saving doc:', error);
-      }
-    }
-  } catch (error) {
-    console.error('Supabase error saving docs:', error);
-  }
-}
-
-function saveDocs(docs) {
-  docsCache = docs;
-  localStorage.setItem(DOCS_KEY, JSON.stringify(docs));
-  saveDocsAsync(docs);
-}
-
-function addDoc(docData) {
-  const docs = loadDocs();
-  const newDoc = {
-    id: generateId('DOC'),
-    title: docData.title || 'Untitled',
-    content: docData.content || '',
-    spaceId: docData.spaceId || null,
-    projectId: docData.projectId || null,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
-  docs.unshift(newDoc);
-  saveDocs(docs);
-  return newDoc;
-}
-
-function updateDoc(docId, updates) {
-  const docs = loadDocs();
-  const index = docs.findIndex(d => d.id === docId);
-  if (index !== -1) {
-    docs[index] = { ...docs[index], ...updates, updatedAt: new Date().toISOString() };
-    saveDocs(docs);
-  }
-  return docs;
-}
-
-async function deleteDocAsync(docId) {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      const { error } = await supabase
-        .from('documents')
-        .delete()
-        .eq('id', docId);
-      if (error) console.error('Error deleting doc:', error);
-    }
-  } catch (error) {
-    console.error('Supabase error deleting doc:', error);
-  }
-}
-
-function deleteDoc(docId) {
-  const docs = loadDocs();
-  const index = docs.findIndex(d => d.id === docId);
-  if (index !== -1) {
-    docs.splice(index, 1);
-    saveDocs(docs);
-    deleteDocAsync(docId);
-  }
-  return docs;
-}
-
-// ============================================
-// Excel/Spreadsheets
-// ============================================
-async function loadExcelsAsync() {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      const { data, error } = await supabase
-        .from('spreadsheets')
-        .select('*')
-        .order('updated_at', { ascending: false });
-      
-      if (error) throw error;
-      excelsCache = data || [];
-      localStorage.setItem(EXCELS_KEY, JSON.stringify(excelsCache));
-      return excelsCache;
-    }
-  } catch (error) {
-    console.error('Supabase error loading excels:', error);
-  }
-  return loadExcelsFromLocalStorage();
-}
-
-function loadExcelsFromLocalStorage() {
-  try {
-    const data = localStorage.getItem(EXCELS_KEY);
-    if (data) return JSON.parse(data);
-  } catch (e) {
-    console.error('Failed to load excels:', e);
-  }
-  return [];
-}
-
-function loadExcels() {
-  if (excelsCache !== null) return excelsCache;
-  excelsCache = loadExcelsFromLocalStorage();
-  loadExcelsAsync().then(data => { excelsCache = data; });
-  return excelsCache;
-}
-
-async function saveExcelsAsync(excels) {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      for (const excel of excels) {
-        const { error } = await supabase
-          .from('spreadsheets')
-          .upsert({
-            id: excel.id,
-            title: excel.title,
-            data: excel.data,
-            space_id: excel.spaceId,
-            project_id: excel.projectId,
-            created_at: excel.createdAt,
-            updated_at: excel.updatedAt
-          }, { onConflict: 'id' });
-        if (error) console.error('Error saving excel:', error);
-      }
-    }
-  } catch (error) {
-    console.error('Supabase error saving excels:', error);
-  }
-}
-
-function saveExcels(excels) {
-  excelsCache = excels;
-  localStorage.setItem(EXCELS_KEY, JSON.stringify(excels));
-  saveExcelsAsync(excels);
-}
-
-function addExcel(excelData) {
-  const excels = loadExcels();
-  const newExcel = {
-    id: generateId('EXCEL'),
-    title: excelData.title || 'Untitled',
-    data: excelData.data || [['', '', ''], ['', '', ''], ['', '', '']],
-    spaceId: excelData.spaceId || null,
-    projectId: excelData.projectId || null,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
-  };
-  excels.unshift(newExcel);
-  saveExcels(excels);
-  return newExcel;
-}
-
-function updateExcel(excelId, updates) {
-  const excels = loadExcels();
-  const index = excels.findIndex(e => e.id === excelId);
-  if (index !== -1) {
-    excels[index] = { ...excels[index], ...updates, updatedAt: new Date().toISOString() };
-    saveExcels(excels);
-  }
-  return excels;
-}
-
-function deleteExcel(excelId) {
-  const excels = loadExcels();
-  const index = excels.findIndex(e => e.id === excelId);
-  if (index !== -1) {
-    excels.splice(index, 1);
-    saveExcels(excels);
-  }
-  return excels;
-}
-
-// ============================================
-// Spaces
-// ============================================
-async function loadSpacesAsync() {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      const { data, error } = await supabase
-        .from('spaces')
-        .select('*')
-        .order('created_at', { ascending: false });
-      
-      if (error) throw error;
-      spacesCache = data || [];
-      localStorage.setItem(SPACES_KEY, JSON.stringify(spacesCache));
-      return spacesCache;
-    }
-  } catch (error) {
-    console.error('Supabase error loading spaces:', error);
-  }
-  return loadSpacesFromLocalStorage();
-}
-
-function loadSpacesFromLocalStorage() {
-  try {
-    const data = localStorage.getItem(SPACES_KEY);
-    if (data) return JSON.parse(data);
-  } catch (e) {
-    console.error('Failed to load spaces:', e);
-  }
-  return [];
-}
-
-function loadSpaces() {
-  if (spacesCache !== null) return spacesCache;
-  spacesCache = loadSpacesFromLocalStorage();
-  loadSpacesAsync().then(data => { spacesCache = data; });
-  return spacesCache;
-}
-
-async function saveSpacesAsync(spaces) {
-  try {
-    const supabase = await getSupabaseClient();
-    if (supabase) {
-      for (const space of spaces) {
-        const { error } = await supabase
-          .from('spaces')
-          .upsert({
-            id: space.id,
-            name: space.name,
-            description: space.description,
-            color: space.color,
-            icon: space.icon,
-            created_at: space.createdAt
-          }, { onConflict: 'id' });
-        if (error) console.error('Error saving space:', error);
-      }
-    }
-  } catch (error) {
-    console.error('Supabase error saving spaces:', error);
-  }
-}
-
-function saveSpaces(spaces) {
-  spacesCache = spaces;
-  localStorage.setItem(SPACES_KEY, JSON.stringify(spaces));
-  saveSpacesAsync(spaces);
-}
-
-function addSpace(spaceData) {
-  const spaces = loadSpaces();
-  const newSpace = {
-    id: generateId('SPACE'),
-    name: spaceData.name,
-    description: spaceData.description || '',
-    color: spaceData.color || '#3b82f6',
-    icon: spaceData.icon || 'folder',
-    createdAt: new Date().toISOString()
-  };
-  spaces.unshift(newSpace);
-  saveSpaces(spaces);
-  return newSpace;
-}
-
-function updateSpace(spaceId, updates) {
-  const spaces = loadSpaces();
-  const index = spaces.findIndex(s => s.id === spaceId);
-  if (index !== -1) {
-    spaces[index] = { ...spaces[index], ...updates };
-    saveSpaces(spaces);
-  }
-  return spaces;
-}
-
-function deleteSpace(spaceId) {
-  const spaces = loadSpaces();
-  const index = spaces.findIndex(s => s.id === spaceId);
-  if (index !== -1) {
-    spaces.splice(index, 1);
-    saveSpaces(spaces);
-  }
-  return spaces;
-}
-
-// ============================================
 // Theme
 // ============================================
 function loadTheme() {
@@ -991,6 +339,11 @@ function saveTheme(theme) {
 // ============================================
 function getRecentActivity(projects) {
   const activity = [];
+  
+  // Handle case where projects might be a promise or undefined
+  if (!projects || !Array.isArray(projects)) {
+    return activity;
+  }
 
   projects.slice().reverse().forEach(project => {
     activity.push({
@@ -1066,17 +419,6 @@ function getStatusColor(status) {
   return colors[status?.toLowerCase()] || colors.todo;
 }
 
-function getEventColor(colorName) {
-  const colors = {
-    'blue': 'hsl(217, 91%, 60%)',
-    'green': 'hsl(142, 71%, 45%)',
-    'purple': 'hsl(271, 91%, 65%)',
-    'orange': 'hsl(24, 90%, 60%)',
-    'red': 'hsl(0, 84%, 60%)',
-  };
-  return colors[colorName] || colors.blue;
-}
-
 function calculateProgress(columns) {
   let total = 0;
   let completed = 0;
@@ -1090,106 +432,6 @@ function calculateProgress(columns) {
   return { total, completed, percentage };
 }
 
-// ============================================
-// Assignments
-// ============================================
-function loadAssignments() {
-  try {
-    const data = localStorage.getItem(ASSIGNMENTS_KEY);
-    return data ? JSON.parse(data) : [];
-  } catch (e) {
-    console.error('Failed to load assignments:', e);
-    return [];
-  }
-}
-
-function saveAssignments(assignments) {
-  try {
-    localStorage.setItem(ASSIGNMENTS_KEY, JSON.stringify(assignments));
-  } catch (e) {
-    console.error('Failed to save assignments:', e);
-    alert('Storage full or error saving assignment. Try removing some files.');
-  }
-}
-
-function addAssignment(assignment) {
-  const assignments = loadAssignments();
-  assignments.unshift(assignment);
-  saveAssignments(assignments);
-}
-
-function deleteAssignment(index) {
-  const assignments = loadAssignments();
-  assignments.splice(index, 1);
-  saveAssignments(assignments);
-}
-
-function openCreateAssignmentModal() {
-  const content = `
-    <form id="createAssignmentForm" onsubmit="handleCreateAssignmentSubmit(event)">
-      <div class="form-group">
-        <label class="form-label">Title <span class="required">*</span></label>
-        <input type="text" name="title" class="form-input" required placeholder="e.g. Math Homework Week 5">
-      </div>
-      
-      <div class="form-group">
-        <label class="form-label">Notes</label>
-        <textarea name="notes" class="form-textarea" rows="6" placeholder="Add your notes, summaries, answers..."></textarea>
-      </div>
-      
-      <div class="form-group">
-        <label class="form-label">Attach files (PDFs, docs, images...)</label>
-        <input type="file" id="assignmentFiles" multiple accept=".pdf,.doc,.docx,.txt,.jpg,.jpeg,.png">
-        <p style="font-size: 13px; color: var(--muted-foreground); margin-top: 8px;">
-          Files will be saved locally. Large files may fill up browser storage.
-        </p>
-      </div>
-      
-      <div class="form-actions">
-        <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-        <button type="submit" class="btn btn-primary">Create Assignment</button>
-      </div>
-    </form>
-  `;
-  openModal('Create Assignment', content);
-}
-
-async function handleCreateAssignmentSubmit(event) {
-  event.preventDefault();
-  const form = event.target;
-  const title = form.title.value.trim();
-  const notes = form.notes.value.trim();
-
-  if (!title) return;
-
-  const fileInput = document.getElementById('assignmentFiles');
-  const files = [];
-
-  for (const file of fileInput.files) {
-    const dataUrl = await new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.readAsDataURL(file);
-    });
-    files.push({
-      name: file.name,
-      type: file.type || 'application/octet-stream',
-      size: file.size,
-      dataUrl
-    });
-  }
-
-  addAssignment({
-    id: generateId('ASSIGN'),
-    title,
-    notes,
-    files,
-    created: new Date().toISOString()
-  });
-
-  closeModal();
-  renderCurrentView();
-}
 
 // ============================================
 // PDF Viewer Functions
@@ -1242,10 +484,12 @@ function downloadFile(dataUrl, fileName) {
   document.body.removeChild(link);
 }
 
+// Legacy function for backwards compatibility
 function openPdfPreview(dataUrl, fileName) {
   openPdfViewer(dataUrl, fileName || 'document.pdf');
 }
 
+// Render file item with view and download buttons
 function renderFileItem(file, fileIndex, assignmentIndex) {
   const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
   const isImage = file.type.startsWith('image/');
@@ -1368,44 +612,3 @@ function formatFileSize(bytes) {
 // ============================================
 // Project Updates (Comments)
 // ============================================
-function loadProjectUpdates(projectIndex) {
-  const projects = loadProjects();
-  if (!projects[projectIndex]) return [];
-  return projects[projectIndex].updates || [];
-}
-
-function addProjectUpdate(projectIndex, message) {
-  const projects = loadProjects();
-  if (!projects[projectIndex]) return;
-
-  const newUpdate = {
-    actor: 'Zeyad Maher',
-    message: message.trim(),
-    time: new Date().toISOString()
-  };
-
-  if (!projects[projectIndex].updates) {
-    projects[projectIndex].updates = [];
-  }
-  projects[projectIndex].updates.unshift(newUpdate);
-  saveProjects(projects);
-}
-
-function getProjectStatus(projectIndex) {
-  const projects = loadProjects();
-  return projects[projectIndex]?.status || 'todo';
-}
-
-// ============================================
-// Initialize data on page load
-// ============================================
-document.addEventListener('DOMContentLoaded', () => {
-  // Pre-load all data from Supabase
-  loadProjectsAsync();
-  loadIssuesAsync();
-  loadBacklogTasksAsync();
-  loadCalendarEventsAsync();
-  loadDocsAsync();
-  loadExcelsAsync();
-  loadSpacesAsync();
-});
