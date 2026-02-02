@@ -536,79 +536,126 @@ function switchAuthMode(mode) {
   renderAuthModal();
 }
 
-function handleAuthSubmit(event) {
+async function handleAuthSubmit(event) {
   event.preventDefault();
   
   const email = document.getElementById('authEmail').value.trim();
   const password = document.getElementById('authPassword').value;
   const errorEl = document.getElementById('authError');
+  const submitBtn = event.target.querySelector('button[type="submit"]');
   
   // Clear previous errors
   errorEl.style.display = 'none';
   
-  if (authMode === 'signup') {
-    const username = document.getElementById('authUsername').value.trim();
-    const confirmPassword = document.getElementById('authConfirmPassword').value;
-    
-    // Validation
-    if (!email || !username || !password || !confirmPassword) {
-      showAuthError('Please fill in all fields');
-      return;
+  // Disable submit button during processing
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = authMode === 'signin' ? 'Signing in...' : 'Creating account...';
+  }
+  
+  try {
+    if (authMode === 'signup') {
+      const username = document.getElementById('authUsername').value.trim();
+      const confirmPassword = document.getElementById('authConfirmPassword').value;
+      
+      // Validation
+      if (!email || !username || !password || !confirmPassword) {
+        showAuthError('Please fill in all fields');
+        return;
+      }
+      
+      if (password !== confirmPassword) {
+        showAuthError('Passwords do not match');
+        return;
+      }
+      
+      if (password.length < 6) {
+        showAuthError('Password must be at least 6 characters');
+        return;
+      }
+      
+      // Use Supabase for signup
+      if (window.LayerDB && window.LayerDB.signUp) {
+        const data = await window.LayerDB.signUp(email, password);
+        
+        // Store username in localStorage temporarily (will be synced to profile)
+        localStorage.setItem('layerPendingUsername', username);
+        
+        closeModal();
+        
+        // Show success message
+        alert('Account created! Please check your email to confirm your account, then sign in.');
+      } else {
+        // Fallback to localStorage if Supabase not available
+        const users = JSON.parse(localStorage.getItem('layerUsers') || '[]');
+        if (users.find(u => u.email === email)) {
+          showAuthError('An account with this email already exists');
+          return;
+        }
+        const newUser = {
+          id: Date.now().toString(),
+          email,
+          username,
+          createdAt: new Date().toISOString()
+        };
+        users.push(newUser);
+        localStorage.setItem('layerUsers', JSON.stringify(users));
+        localStorage.setItem('layerCurrentUser', JSON.stringify(newUser));
+        closeModal();
+        updateUserDisplay(newUser);
+      }
+      
+    } else {
+      // Sign In
+      if (!email || !password) {
+        showAuthError('Please enter your email and password');
+        return;
+      }
+      
+      // Use Supabase for signin
+      if (window.LayerDB && window.LayerDB.signIn) {
+        const data = await window.LayerDB.signIn(email, password);
+        
+        const user = data.user;
+        const displayUser = {
+          id: user.id,
+          email: user.email,
+          username: user.email.split('@')[0],
+          name: user.email.split('@')[0]
+        };
+        
+        localStorage.setItem('layerCurrentUser', JSON.stringify(displayUser));
+        closeModal();
+        updateUserDisplay(displayUser);
+        
+        // Sync data from Supabase after login
+        await syncDataFromSupabase();
+        renderCurrentView();
+        
+      } else {
+        // Fallback to localStorage
+        const users = JSON.parse(localStorage.getItem('layerUsers') || '[]');
+        const user = users.find(u => u.email === email);
+        
+        if (!user) {
+          showAuthError('Invalid email or password');
+          return;
+        }
+        
+        localStorage.setItem('layerCurrentUser', JSON.stringify(user));
+        closeModal();
+        updateUserDisplay(user);
+      }
     }
-    
-    if (password !== confirmPassword) {
-      showAuthError('Passwords do not match');
-      return;
+  } catch (error) {
+    console.error('Auth error:', error);
+    showAuthError(error.message || 'Authentication failed. Please try again.');
+  } finally {
+    // Re-enable submit button
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = authMode === 'signin' ? 'Sign In' : 'Create Account';
     }
-    
-    if (password.length < 6) {
-      showAuthError('Password must be at least 6 characters');
-      return;
-    }
-    
-    // Store user data (localStorage simulation)
-    const users = JSON.parse(localStorage.getItem('layerUsers') || '[]');
-    
-    // Check if email already exists
-    if (users.find(u => u.email === email)) {
-      showAuthError('An account with this email already exists');
-      return;
-    }
-    
-    // Add new user
-    const newUser = {
-      id: Date.now().toString(),
-      email,
-      username,
-      password, // Note: In production, never store plain passwords
-      createdAt: new Date().toISOString()
-    };
-    
-    users.push(newUser);
-    localStorage.setItem('layerUsers', JSON.stringify(users));
-    localStorage.setItem('layerCurrentUser', JSON.stringify(newUser));
-    
-    closeModal();
-    updateUserDisplay(newUser);
-    
-  } else {
-    // Sign In
-    if (!email || !password) {
-      showAuthError('Please enter your email and password');
-      return;
-    }
-    
-    const users = JSON.parse(localStorage.getItem('layerUsers') || '[]');
-    const user = users.find(u => u.email === email && u.password === password);
-    
-    if (!user) {
-      showAuthError('Invalid email or password');
-      return;
-    }
-    
-    localStorage.setItem('layerCurrentUser', JSON.stringify(user));
-    closeModal();
-    updateUserDisplay(user);
   }
 }
 
@@ -638,8 +685,29 @@ function updateUserDisplay(user) {
   }
 }
 
-function signOut() {
+async function signOut() {
+  try {
+    // Sign out from Supabase
+    if (window.LayerDB && window.LayerDB.signOut) {
+      await window.LayerDB.signOut();
+    }
+  } catch (error) {
+    console.error('Sign out error:', error);
+  }
+  
+  // Clear local user data
   localStorage.removeItem('layerCurrentUser');
+  
+  // Clear all cached data to ensure fresh load on next login
+  localStorage.removeItem('layerCalendarEvents');
+  localStorage.removeItem('layerProjectsData');
+  localStorage.removeItem('layerMyIssues');
+  localStorage.removeItem('layerBacklogTasks');
+  localStorage.removeItem('layerDocs');
+  localStorage.removeItem('layerExcels');
+  localStorage.removeItem('layerSpaces');
+  localStorage.removeItem('layerRecurringTasks');
+  
   const userInfo = document.getElementById('userInfo');
   if (userInfo) {
     userInfo.outerHTML = `
@@ -653,6 +721,9 @@ function signOut() {
       </button>
     `;
   }
+  
+  // Re-render to show empty state (no user data)
+  renderCurrentView();
 }
 
 async function checkExistingSession() {
@@ -723,47 +794,33 @@ async function syncDataFromSupabase() {
   try {
     console.log('Syncing data from Supabase...');
     
-    // Sync calendar events
+    // Sync calendar events - always update localStorage with what's in Supabase
     const events = await window.LayerDB.loadCalendarEvents();
-    if (events && events.length > 0) {
-      localStorage.setItem('layerCalendarEvents', JSON.stringify(events));
-    }
+    localStorage.setItem('layerCalendarEvents', JSON.stringify(events || []));
     
     // Sync projects
     const projects = await window.LayerDB.loadProjects();
-    if (projects && projects.length > 0) {
-      localStorage.setItem('layerProjectsData', JSON.stringify(projects));
-    }
+    localStorage.setItem('layerProjectsData', JSON.stringify(projects || []));
     
     // Sync issues
     const issues = await window.LayerDB.loadIssues();
-    if (issues && issues.length > 0) {
-      localStorage.setItem('layerMyIssues', JSON.stringify(issues));
-    }
+    localStorage.setItem('layerMyIssues', JSON.stringify(issues || []));
     
     // Sync backlog tasks
     const backlog = await window.LayerDB.loadBacklogTasks();
-    if (backlog && backlog.length > 0) {
-      localStorage.setItem('layerBacklogTasks', JSON.stringify(backlog));
-    }
+    localStorage.setItem('layerBacklogTasks', JSON.stringify(backlog || []));
     
     // Sync docs
     const docs = await window.LayerDB.loadDocs();
-    if (docs && docs.length > 0) {
-      localStorage.setItem('layerDocs', JSON.stringify(docs));
-    }
+    localStorage.setItem('layerDocs', JSON.stringify(docs || []));
     
     // Sync excels
     const excels = await window.LayerDB.loadExcels();
-    if (excels && excels.length > 0) {
-      localStorage.setItem('layerExcels', JSON.stringify(excels));
-    }
+    localStorage.setItem('layerExcels', JSON.stringify(excels || []));
     
     // Sync spaces
     const spaces = await window.LayerDB.loadSpaces();
-    if (spaces && spaces.length > 0) {
-      localStorage.setItem('layerSpaces', JSON.stringify(spaces));
-    }
+    localStorage.setItem('layerSpaces', JSON.stringify(spaces || []));
     
     console.log('Data sync complete!');
   } catch (err) {
