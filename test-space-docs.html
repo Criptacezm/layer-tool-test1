@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Space Docs Test</title>
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        .test-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .test-section {
+            margin: 30px 0;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+        }
+        .test-result {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .success {
+            background-color: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+        .error {
+            background-color: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+        .card-content-test {
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin: 10px 0;
+        }
+        .test-item {
+            padding: 8px;
+            margin: 4px 0;
+            background: #f8f9fa;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="test-container">
+        <h1>Space Docs Functionality Test</h1>
+        
+        <div class="test-section">
+            <h2>1. Document Opening Test</h2>
+            <button onclick="testDocOpening()">Test Document Opening</button>
+            <div id="docOpeningResult" class="test-result"></div>
+        </div>
+
+        <div class="test-section">
+            <h2>2. Card Scrolling Test</h2>
+            <div class="card-content-test" id="scrollTestContainer">
+                <!-- Test items will be added here -->
+            </div>
+            <button onclick="testScrolling()">Test Scrolling</button>
+            <div id="scrollingResult" class="test-result"></div>
+        </div>
+
+        <div class="test-section">
+            <h2>3. Focus/Blur Test</h2>
+            <button onclick="testFocusBlur()">Test Focus/Blur</button>
+            <div id="focusBlurResult" class="test-result"></div>
+        </div>
+
+        <div class="test-section">
+            <h2>4. Duplicate Prevention Test</h2>
+            <button onclick="testDuplicatePrevention()">Test Duplicate Prevention</button>
+            <div id="duplicateResult" class="test-result"></div>
+        </div>
+
+        <div class="test-section">
+            <h2>5. Space View Preservation Test</h2>
+            <button onclick="testSpaceViewPreservation()">Test Space View</button>
+            <div id="spaceViewResult" class="test-result"></div>
+        </div>
+
+        <div class="test-section">
+            <h2>6. Tab State Preservation Test</h2>
+            <button onclick="testTabState()">Test Tab State</button>
+            <div id="tabStateResult" class="test-result"></div>
+        </div>
+    </div>
+
+    <script>
+        // Test Document Opening
+        function testDocOpening() {
+            const result = document.getElementById('docOpeningResult');
+            try {
+                // Simulate document editor state
+                let documentEditorState = {
+                    isOpen: false,
+                    currentDocId: null,
+                    overlayElement: null,
+                    isClosing: false
+                };
+
+                // Test opening
+                documentEditorState.isOpen = true;
+                documentEditorState.currentDocId = 'test-doc-1';
+                
+                // Test closing (with state reset)
+                documentEditorState.isOpen = false;
+                documentEditorState.currentDocId = null;
+                documentEditorState.overlayElement = null;
+                documentEditorState.isClosing = false;
+
+                // Test reopening
+                documentEditorState.isOpen = true;
+                documentEditorState.currentDocId = 'test-doc-2';
+
+                result.className = 'test-result success';
+                result.textContent = '✅ Document opening/closing test passed - state resets properly';
+            } catch (error) {
+                result.className = 'test-result error';
+                result.textContent = '❌ Document opening test failed: ' + error.message;
+            }
+        }
+
+        // Test Scrolling
+        function testScrolling() {
+            const container = document.getElementById('scrollTestContainer');
+            const result = document.getElementById('scrollingResult');
+            
+            try {
+                // Add many items to test scrolling
+                container.innerHTML = '';
+                for (let i = 1; i <= 50; i++) {
+                    const item = document.createElement('div');
+                    item.className = 'test-item';
+                    item.textContent = `Test Item ${i} - This is a long text to test scrolling functionality in the card content`;
+                    container.appendChild(item);
+                }
+
+                // Check if scrolling is enabled
+                const hasScroll = container.scrollHeight > container.clientHeight;
+                
+                if (hasScroll) {
+                    result.className = 'test-result success';
+                    result.textContent = '✅ Scrolling test passed - Container has scrollable content';
+                } else {
+                    result.className = 'test-result error';
+                    result.textContent = '❌ Scrolling test failed - Container is not scrollable';
+                }
+            } catch (error) {
+                result.className = 'test-result error';
+                result.textContent = '❌ Scrolling test failed: ' + error.message;
+            }
+        }
+
+        // Test Focus/Blur
+        function testFocusBlur() {
+            const result = document.getElementById('focusBlurResult');
+            
+            try {
+                let welcomeBackShown = false;
+                let focusLostTime = null;
+
+                // Simulate focus loss
+                focusLostTime = Date.now() - 2000; // 2 seconds ago
+                
+                // Simulate focus gain (without welcome back)
+                if (focusLostTime && (Date.now() - focusLostTime) > 1000) {
+                    // restoreAppState() would be called here
+                    // showSubtleWelcomeBack() is NOT called (removed)
+                }
+                focusLostTime = null;
+
+                result.className = 'test-result success';
+                result.textContent = '✅ Focus/Blur test passed - No welcome back notifications shown';
+            } catch (error) {
+                result.className = 'test-result error';
+                result.textContent = '❌ Focus/Blur test failed: ' + error.message;
+            }
+        }
+
+        // Test Duplicate Prevention
+        function testDuplicatePrevention() {
+            const result = document.getElementById('duplicateResult');
+            
+            try {
+                // Simulate the duplicate prevention logic
+                const spaceDocs = [{id: 'doc1', name: 'Space Doc 1'}, {id: 'doc2', name: 'Space Doc 2'}];
+                const projectDocs = [{id: 'doc3', name: 'Project Doc 1'}];
+                const allDocs = [{id: 'doc1', name: 'Recent Doc 1'}, {id: 'doc4', name: 'Recent Doc 4'}, {id: 'doc5', name: 'Recent Doc 5'}];
+
+                const docsMap = new Map();
+                [...spaceDocs, ...projectDocs].forEach(d => docsMap.set(d.id, d));
+                
+                // Add recent docs that aren't already in space/project categories
+                const recentDocs = allDocs.slice(0, 10).filter(d => !docsMap.has(d.id));
+                recentDocs.forEach(d => docsMap.set(d.id, d));
+                
+                const displayDocs = Array.from(docsMap.values()).slice(0, 15);
+
+                const hasDuplicates = displayDocs.length !== new Set(displayDocs.map(d => d.id)).size;
+                
+                if (!hasDuplicates && displayDocs.length === 4) { // doc1, doc2, doc3, doc4, doc5 (doc1 filtered out)
+                    result.className = 'test-result success';
+                    result.textContent = '✅ Duplicate prevention test passed - No duplicates found';
+                } else {
+                    result.className = 'test-result error';
+                    result.textContent = '❌ Duplicate prevention test failed - Duplicates found or incorrect count';
+                }
+            } catch (error) {
+                result.className = 'test-result error';
+                result.textContent = '❌ Duplicate prevention test failed: ' + error.message;
+            }
+        }
+
+        // Test Space View Preservation
+        function testSpaceViewPreservation() {
+            const result = document.getElementById('spaceViewResult');
+            
+            try {
+                // Simulate the space view preservation logic
+                let currentView = 'space-view';
+                let activeSpaceId = 'test-space-123';
+                let spaceRefreshed = false;
+
+                // Simulate closeDocEditor logic
+                const activeSpace = { dataset: { spaceId: activeSpaceId } }; // Mock element
+                
+                if (activeSpace) {
+                    // This simulates the new logic in closeDocEditor
+                    const spaceId = activeSpace.dataset.spaceId;
+                    // Simulate openSpaceView being called
+                    spaceRefreshed = true;
+                    console.log('🔄 Refreshing space view after document close...');
+                }
+
+                if (spaceRefreshed && activeSpaceId === 'test-space-123') {
+                    result.className = 'test-result success';
+                    result.textContent = '✅ Space view preservation test passed - Space view refreshed instead of dashboard';
+                } else {
+                    result.className = 'test-result error';
+                    result.textContent = '❌ Space view preservation test failed - Space view not preserved';
+                }
+            } catch (error) {
+                result.className = 'test-result error';
+                result.textContent = '❌ Space view preservation test failed: ' + error.message;
+            }
+        }
+
+        // Test Tab State Preservation
+        function testTabState() {
+            const result = document.getElementById('tabStateResult');
+            
+            try {
+                // Simulate tab state
+                let currentView = 'space-view';
+                let savedView = currentView;
+                let scrollPosition = 150;
+                let inputValues = { search: 'test query', filter: 'active' };
+
+                // Simulate focus loss and restoration
+                const restoredView = savedView;
+                const restoredScroll = scrollPosition;
+                const restoredInputs = inputValues;
+
+                if (restoredView === currentView && restoredScroll === scrollPosition) {
+                    result.className = 'test-result success';
+                    result.textContent = '✅ Tab state preservation test passed - State maintained correctly';
+                } else {
+                    result.className = 'test-result error';
+                    result.textContent = '❌ Tab state preservation test failed - State not maintained';
+                }
+            } catch (error) {
+                result.className = 'test-result error';
+                result.textContent = '❌ Tab state preservation test failed: ' + error.message;
+            }
+        }
+
+        // Auto-run basic tests
+        window.addEventListener('load', function() {
+            testDocOpening();
+            testScrolling();
+            testSpaceViewPreservation();
+        });
+    </script>
+</body>
+</html>

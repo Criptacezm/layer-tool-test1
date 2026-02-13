@@ -9,6 +9,67 @@ let currentView = 'inbox';
 let currentFilter = 'all';
 let searchQuery = '';
 let selectedProjectIndex = null;
+let currentProjectTab = 'overview'; // Track the current tab within project detail view
+let lastRenderTime = 0; // Track last render time to prevent rapid renders
+let lastRenderContext = null; // Track render context to prevent redundant renders
+const RENDER_DEBOUNCE = 100; // Minimum time between renders in ms
+
+// ============================================
+// Notification System
+// ============================================
+function showNotification(message, type = 'info') {
+  // Remove existing notifications
+  const existing = document.querySelector('.notification-toast');
+  if (existing) existing.remove();
+
+  const notification = document.createElement('div');
+  notification.className = `notification-toast notification-${type}`;
+  notification.innerHTML = `
+    <span>${message}</span>
+    <button onclick="this.parentElement.remove()" style="background:none;border:none;color:inherit;cursor:pointer;padding:4px;margin-left:8px;">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;">
+        <path d="M18 6L6 18M6 6l12 12"/>
+      </svg>
+    </button>
+  `;
+
+  // Add styles inline if not already present
+  notification.style.cssText = `
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    padding: 12px 16px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    z-index: 10000;
+    animation: slideIn 0.3s ease;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    font-size: 14px;
+    max-width: 350px;
+  `;
+
+  // Type-specific colors
+  const colors = {
+    success: { bg: '#10b981', color: '#fff' },
+    error: { bg: '#ef4444', color: '#fff' },
+    info: { bg: '#3b82f6', color: '#fff' },
+    warning: { bg: '#f59e0b', color: '#fff' }
+  };
+
+  const colorScheme = colors[type] || colors.info;
+  notification.style.backgroundColor = colorScheme.bg;
+  notification.style.color = colorScheme.color;
+
+  document.body.appendChild(notification);
+
+  // Auto-remove after 4 seconds
+  setTimeout(() => {
+    notification.style.animation = 'slideOut 0.3s ease';
+    setTimeout(() => notification.remove(), 300);
+  }, 4000);
+}
 
 // ============================================
 // DOM Elements
@@ -23,46 +84,254 @@ const modalClose = document.getElementById('modalClose');
 const themeToggle = document.getElementById('themeToggle');
 
 // ============================================
+// Realtime Subscriptions
+// ============================================
+
+let realtimeChannel = null;
+let projectDetailChannel = null;
+
+function setupRealtimeSubscription() {
+  if (!window.LayerDB?.isAuthenticated()) {
+    console.log('User not authenticated, skipping realtime subscription');
+    return;
+  }
+
+  // Clean up existing subscription
+  if (realtimeChannel) {
+    window.LayerDB.unsubscribeFromProjects();
+    realtimeChannel = null;
+  }
+
+  console.log('Setting up realtime subscription for projects...');
+
+  // Subscribe to all user projects with proper handling
+  realtimeChannel = window.LayerDB.subscribeToUserProjects(async (payload) => {
+    console.log('Realtime change received:', payload.table, payload.eventType);
+
+    try {
+      // Refresh projects from database
+      const freshProjects = await window.LayerDB.loadProjects();
+      saveProjectsToCache(freshProjects);
+
+      // Handle project_members changes
+      if (payload.table === 'project_members') {
+        await handleMemberRealtimeUpdate(payload, freshProjects);
+        return;
+      }
+
+      // Handle projects table changes
+      if (payload.table === 'projects') {
+        await handleProjectRealtimeUpdate(payload, freshProjects);
+        return;
+      }
+
+      // Fallback: re-render current view
+      renderCurrentView();
+
+    } catch (error) {
+      console.error('Error handling realtime update:', error);
+      renderCurrentView();
+    }
+  });
+
+  console.log('Realtime subscription established');
+}
+
+// Handle member add/remove/leave realtime events
+async function handleMemberRealtimeUpdate(payload, freshProjects) {
+  const currentUser = window.LayerDB?.getCurrentUser();
+  const { eventType, new: newRecord, old: oldRecord } = payload;
+  const record = newRecord || oldRecord;
+
+  if (!record) return;
+
+  // Check if this affects the current user
+  const affectsCurrentUser = record.user_id === currentUser?.id;
+
+  if (eventType === 'INSERT') {
+    // New member added
+    if (affectsCurrentUser) {
+      showNotification('You were added to a project!', 'success');
+    } else {
+      showNotification('A new member joined the project', 'success');
+    }
+  } else if (eventType === 'DELETE') {
+    // Member removed or left
+    if (affectsCurrentUser) {
+      // Current user was removed - navigate away from project
+      showNotification('You have been removed from the project', 'warning');
+      if (currentView === 'project-detail') {
+        currentView = 'activity';
+        selectedProjectIndex = null;
+      }
+    } else {
+      showNotification('A member left the project', 'info');
+    }
+  }
+
+  // Refresh the current view
+  if (currentView === 'project-detail' && selectedProjectIndex !== null) {
+    // Try to find the project by ID after refresh
+    const currentProject = loadProjects()[selectedProjectIndex];
+    if (currentProject && record.project_id === currentProject.id) {
+      if (typeof refreshTeamMembersDisplay === 'function') {
+        refreshTeamMembersDisplay(selectedProjectIndex);
+      } else {
+        renderCurrentView();
+      }
+    } else {
+      renderCurrentView();
+    }
+  } else {
+    renderCurrentView();
+  }
+}
+
+// Handle project update/delete realtime events
+async function handleProjectRealtimeUpdate(payload, freshProjects) {
+  const { eventType, new: newRecord, old: oldRecord } = payload;
+
+  if (eventType === 'UPDATE') {
+    // Check if team members changed (legacy support)
+    const oldMembers = oldRecord?.team_members || [];
+    const newMembers = newRecord?.team_members || [];
+
+    if (JSON.stringify(oldMembers.sort()) !== JSON.stringify(newMembers.sort())) {
+      const addedMembers = newMembers.filter(m => !oldMembers.includes(m));
+      const removedMembers = oldMembers.filter(m => !newMembers.includes(m));
+
+      if (addedMembers.length > 0) {
+        showNotification(`${addedMembers.join(', ')} joined the project`, 'success');
+      }
+      if (removedMembers.length > 0) {
+        showNotification(`${removedMembers.join(', ')} left the project`, 'info');
+      }
+    } else {
+      // General project update (no notification needed for every update)
+    }
+  } else if (eventType === 'INSERT') {
+    showNotification('New project added', 'success');
+  } else if (eventType === 'DELETE') {
+    // If we're viewing the deleted project, go back to list
+    if (currentView === 'project-detail' && selectedProjectIndex !== null) {
+      const currentProject = loadProjects()[selectedProjectIndex];
+      if (!currentProject || currentProject.id === oldRecord?.id) {
+        selectedProjectIndex = null;
+        currentView = 'activity';
+        showNotification('Project deleted', 'warning');
+      }
+    } else {
+      showNotification('Project deleted', 'warning');
+    }
+  }
+
+  // Refresh current view
+  renderCurrentView();
+}
+
+// Setup realtime for specific project detail view
+function setupProjectDetailRealtime(projectId) {
+  if (!window.LayerRealtime || !projectId) return;
+
+  console.log('Setting up project detail realtime for:', projectId);
+
+  // Subscribe with specific callbacks
+  projectDetailChannel = window.LayerRealtime.subscribeToProjectDetail(projectId, {
+    onProjectUpdate: async (payload) => {
+      console.log('Project detail updated:', payload);
+      await refreshProjects();
+      if (currentView === 'project-detail') {
+        renderCurrentView();
+      }
+    },
+    onMemberAdded: async (payload) => {
+      console.log('Member added to project:', payload);
+      await refreshProjects();
+      if (currentView === 'project-detail' && typeof refreshTeamMembersDisplay === 'function') {
+        refreshTeamMembersDisplay(selectedProjectIndex);
+      }
+      showNotification('New member added to the project', 'success');
+    },
+    onMemberRemoved: async (payload) => {
+      console.log('Member removed from project:', payload);
+      const currentUser = window.LayerDB?.getCurrentUser();
+
+      // Check if current user was removed
+      if (payload.old?.user_id === currentUser?.id) {
+        showNotification('You have been removed from this project', 'warning');
+        currentView = 'activity';
+        selectedProjectIndex = null;
+        await refreshProjects();
+        renderCurrentView();
+        return;
+      }
+
+      await refreshProjects();
+      if (currentView === 'project-detail' && typeof refreshTeamMembersDisplay === 'function') {
+        refreshTeamMembersDisplay(selectedProjectIndex);
+      }
+      showNotification('A member left the project', 'info');
+    },
+    onProjectDeleted: async (payload) => {
+      console.log('Project deleted:', payload);
+      showNotification('This project has been deleted', 'warning');
+      currentView = 'activity';
+      selectedProjectIndex = null;
+      await refreshProjects();
+      renderCurrentView();
+    }
+  });
+}
+
+// Cleanup project detail realtime
+function cleanupProjectDetailRealtime() {
+  if (window.LayerRealtime) {
+    window.LayerRealtime.unsubscribeFromProjectDetail();
+  }
+  projectDetailChannel = null;
+}
+
+// ============================================
 // Initialization
 // ============================================
 function init() {
-  // Short, smooth loading screen - 0.8s animation + 0.4s fade
+  // Professional loading sequence - refined timing for smooth animation
   const loadingScreen = document.getElementById('loadingScreen');
   const appContainer = document.getElementById('app');
-  
+
   setTimeout(() => {
     loadingScreen.classList.add('fade-out');
     appContainer.style.opacity = '1';
-    appContainer.style.transition = 'opacity 0.4s cubic-bezier(0.4, 0, 0.2, 1)';
-    
+    appContainer.style.transition = 'opacity 1.2s cubic-bezier(0.4, 0, 0.2, 1)';
+
     // Remove loading screen from DOM after fade
     setTimeout(() => {
       loadingScreen.remove();
-    }, 400);
-    
+    }, 1200);
+
     // Show beta notification popup after short delay
     setTimeout(() => {
       showBetaNotification();
-    }, 500);
-  }, 900);
+    }, 800);
+  }, 2200); // Increased delay to allow the beautiful reveal animation to play out
 
   // Load theme with mode support
   initTheme();
 
   // Set up navigation
   setupNavigation();
-  
+
   // Set up mobile navigation
   setupMobileNavigation();
 
   // Set up sidebar collapse
   setupSidebarCollapse();
-  
+
   // Initialize sidebar sections (collapsible)
   initSidebarSections();
   // Set up search
   setupSearch();
-  
+
   // Set up mobile search
   setupMobileSearch();
 
@@ -77,7 +346,7 @@ function init() {
 
   // Render initial view
   renderCurrentView();
-  
+
   // Initialize AI icon morphing animation
   initAIIconMorph();
 }
@@ -90,12 +359,12 @@ function showBetaNotification() {
   if (localStorage.getItem('hideBetaNotification') === 'true') {
     return;
   }
-  
+
   // Create overlay
   const overlay = document.createElement('div');
   overlay.className = 'beta-notification-overlay';
   overlay.id = 'betaNotificationOverlay';
-  
+
   overlay.innerHTML = `
     <div class="beta-notification">
       <div class="beta-notification-icon">
@@ -116,14 +385,14 @@ function showBetaNotification() {
       <button class="beta-notification-close" onclick="closeBetaNotification()">Got it</button>
     </div>
   `;
-  
+
   document.body.appendChild(overlay);
-  
+
   // Trigger animation
   requestAnimationFrame(() => {
     overlay.classList.add('show');
   });
-  
+
   // Close when clicking outside
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) {
@@ -138,7 +407,7 @@ function closeBetaNotification() {
   if (checkbox && checkbox.checked) {
     localStorage.setItem('hideBetaNotification', 'true');
   }
-  
+
   const overlay = document.getElementById('betaNotificationOverlay');
   if (overlay) {
     overlay.classList.remove('show');
@@ -196,7 +465,7 @@ function initSidebarSections() {
       }
     }
   });
-  
+
   // Load collapsed teams state
   const collapsedTeams = JSON.parse(localStorage.getItem('layerCollapsedTeams') || '{}');
   Object.keys(collapsedTeams).forEach(teamName => {
@@ -219,13 +488,13 @@ function initSidebarSections() {
 function setupSidebarCollapse() {
   const sidebar = document.getElementById('sidebar');
   const collapseBtn = document.getElementById('sidebarCollapseBtn');
-  
+
   // Load saved state
   const isCollapsed = localStorage.getItem('layerSidebarCollapsed') === 'true';
   if (isCollapsed) {
     sidebar.classList.add('collapsed');
   }
-  
+
   if (collapseBtn) {
     collapseBtn.addEventListener('click', () => {
       sidebar.classList.toggle('collapsed');
@@ -233,38 +502,20 @@ function setupSidebarCollapse() {
       localStorage.setItem('layerSidebarCollapsed', collapsed);
     });
   }
-  
-  // Initialize workspace section state
-  initWorkspaceSection();
 }
 
 // ============================================
-// Workspace Section Toggle
+// Workspace Section Toggle - REMOVED
 // ============================================
-function initWorkspaceSection() {
-  // Always start expanded by default
-  const workspaceSection = document.getElementById('workspaceSection');
-  if (workspaceSection) {
-    workspaceSection.classList.add('expanded');
-  }
-}
-
-function toggleWorkspaceSection(event) {
-  if (event) event.stopPropagation();
-  
-  const workspaceSection = document.getElementById('workspaceSection');
-  
-  if (workspaceSection) {
-    workspaceSection.classList.toggle('expanded');
-  }
-}
+// Workspace toggle functionality has been removed
+// Projects button is now directly in the navigation
 
 // ============================================
 // Navigation
 // ============================================
 function setupNavigation() {
   const navItems = document.querySelectorAll('.nav-item');
-  
+
   navItems.forEach(item => {
     item.addEventListener('click', () => {
       const view = item.dataset.view;
@@ -295,7 +546,13 @@ function setActiveNav(view) {
       item.classList.remove('active');
     }
   });
-  
+
+  // Clear active state from all space items
+  const spaceItems = document.querySelectorAll('.custom-space-item');
+  spaceItems.forEach(item => {
+    item.classList.remove('active');
+  });
+
   // Mobile bottom nav
   const mobileNavItems = document.querySelectorAll('.mobile-nav-item');
   mobileNavItems.forEach(item => {
@@ -310,7 +567,7 @@ function setActiveNav(view) {
 // Mobile Bottom Navigation
 function setupMobileNavigation() {
   const mobileNavItems = document.querySelectorAll('.mobile-nav-item');
-  
+
   mobileNavItems.forEach(item => {
     item.addEventListener('click', () => {
       const view = item.dataset.view;
@@ -351,7 +608,7 @@ function setupSearch() {
 function initTheme() {
   const savedTheme = loadTheme();
   const savedMode = localStorage.getItem('layerThemeMode') || 'dark';
-  
+
   if (savedTheme === 'light') {
     document.body.classList.add('light');
   } else if (savedTheme === 'dark') {
@@ -369,7 +626,7 @@ function setupThemeToggle() {
   if (desktopToggle) {
     desktopToggle.addEventListener('click', toggleThemeMode);
   }
-  
+
   // Mobile theme toggle
   const mobileToggle = document.getElementById('mobileThemeToggle');
   if (mobileToggle) {
@@ -380,7 +637,7 @@ function setupThemeToggle() {
 function toggleThemeMode() {
   const currentTheme = loadTheme();
   const currentMode = localStorage.getItem('layerThemeMode') || 'dark';
-  
+
   if (currentTheme === 'dark' || currentTheme === 'light') {
     // Toggle between built-in dark and light
     if (document.body.classList.contains('light')) {
@@ -405,7 +662,7 @@ function setupMobileSearch() {
   const searchBtn = document.getElementById('mobileSearchBtn');
   const searchOverlay = document.getElementById('mobileSearchOverlay');
   const mobileSearchInput = document.getElementById('mobileSearchInput');
-  
+
   if (searchBtn && searchOverlay) {
     searchBtn.addEventListener('click', () => {
       searchOverlay.classList.add('active');
@@ -413,19 +670,19 @@ function setupMobileSearch() {
         setTimeout(() => mobileSearchInput.focus(), 300);
       }
     });
-    
+
     searchOverlay.addEventListener('click', (e) => {
       if (e.target === searchOverlay) {
         searchOverlay.classList.remove('active');
       }
     });
-    
+
     if (mobileSearchInput) {
       mobileSearchInput.addEventListener('input', (e) => {
         searchQuery = e.target.value;
         renderCurrentView();
       });
-      
+
       mobileSearchInput.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
           searchOverlay.classList.remove('active');
@@ -445,7 +702,7 @@ function setupModal() {
       closeModal();
     }
   });
-  
+
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       closeModal();
@@ -461,6 +718,8 @@ function openModal(title, content) {
 
 function closeModal() {
   modalOverlay.classList.remove('active');
+  const modalEl = document.getElementById('modal');
+  if (modalEl) modalEl.classList.remove('modal-auth-variant');
 }
 
 // ============================================
@@ -476,58 +735,101 @@ function openAuthModal() {
 function renderAuthModal() {
   const isSignIn = authMode === 'signin';
   const title = isSignIn ? 'Sign In' : 'Create Account';
-  
+
   const content = `
-    <div class="auth-form">
-      <div class="auth-tabs">
-        <button class="auth-tab ${isSignIn ? 'active' : ''}" onclick="switchAuthMode('signin')">Sign In</button>
-        <button class="auth-tab ${!isSignIn ? 'active' : ''}" onclick="switchAuthMode('signup')">Sign Up</button>
+    <div class="auth-container">
+      <div class="auth-header-minimal">
+        <h2 class="auth-title-large">${isSignIn ? 'Welcome back' : 'Join Layer'}</h2>
+        <p class="auth-subtitle-minimal">${isSignIn ? 'Sign in to your workspace to continue' : 'Create your professional workspace today'}</p>
+      </div>
+
+      <div class="auth-tabs-modern">
+        <button class="auth-tab-modern ${isSignIn ? 'active' : ''}" onclick="switchAuthMode('signin')">Sign In</button>
+        <button class="auth-tab-modern ${!isSignIn ? 'active' : ''}" onclick="switchAuthMode('signup')">Sign Up</button>
       </div>
       
-      <form id="authForm" onsubmit="handleAuthSubmit(event)">
-        <div class="form-group">
-          <label class="form-label">Email <span class="required">*</span></label>
-          <input type="email" class="form-input" id="authEmail" placeholder="Enter your email" required />
+      <form id="authForm" class="auth-form-modern" onsubmit="handleAuthSubmit(event)">
+        <div class="form-group-modern">
+          <label class="form-label-modern">Email Address</label>
+          <div class="input-wrapper-modern">
+            <svg class="input-icon-modern" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/>
+            </svg>
+            <input type="email" class="form-input-modern" id="authEmail" placeholder="name@company.com" required />
+          </div>
         </div>
         
         ${!isSignIn ? `
-        <div class="form-group">
-          <label class="form-label">Username <span class="required">*</span></label>
-          <input type="text" class="form-input" id="authUsername" placeholder="Choose a username" required />
+        <div class="form-group-modern">
+          <label class="form-label-modern">Username</label>
+          <div class="input-wrapper-modern">
+            <svg class="input-icon-modern" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
+            </svg>
+            <input type="text" class="form-input-modern" id="authUsername" placeholder="Your name" required />
+          </div>
         </div>
         ` : ''}
         
-        <div class="form-group">
-          <label class="form-label">Password <span class="required">*</span></label>
-          <input type="password" class="form-input" id="authPassword" placeholder="Enter your password" required minlength="6" />
+        <div class="form-group-modern">
+          <label class="form-label-modern">Password</label>
+          <div class="input-wrapper-modern">
+            <svg class="input-icon-modern" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+            <input type="password" class="form-input-modern" id="authPassword" placeholder="••••••••" required minlength="6" />
+          </div>
         </div>
         
         ${!isSignIn ? `
-        <div class="form-group">
-          <label class="form-label">Confirm Password <span class="required">*</span></label>
-          <input type="password" class="form-input" id="authConfirmPassword" placeholder="Confirm your password" required minlength="6" />
+        <div class="form-group-modern">
+          <label class="form-label-modern">Confirm Password</label>
+          <div class="input-wrapper-modern">
+            <svg class="input-icon-modern" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            </svg>
+            <input type="password" class="form-input-modern" id="authConfirmPassword" placeholder="••••••••" required minlength="6" />
+          </div>
         </div>
         ` : ''}
         
-        <div id="authError" class="auth-error" style="display: none;"></div>
+        <div id="authError" class="auth-error-modern" style="display: none;"></div>
         
-        <div class="form-actions">
-          <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-          <button type="submit" class="btn btn-primary">${isSignIn ? 'Sign In' : 'Create Account'}</button>
-        </div>
+        <button type="submit" class="auth-submit-btn">
+          <span>${isSignIn ? 'Sign In' : 'Create Account'}</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <path d="M5 12h14M12 5l7 7-7 7"/>
+          </svg>
+        </button>
       </form>
+
+      <div class="auth-divider-modern">
+        <span>or continue with</span>
+      </div>
+
+      <button type="button" class="google-auth-btn-modern" onclick="handleGoogleSignIn()">
+        <svg viewBox="0 0 48 48">
+          <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"></path>
+          <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"></path>
+          <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24s.92 7.54 2.56 10.78l7.97-6.19z"></path>
+          <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"></path>
+        </svg>
+        <span>Google</span>
+      </button>
       
-      <div class="auth-footer">
-        ${isSignIn ? 
-          '<p>Don\'t have an account? <a href="#" onclick="switchAuthMode(\'signup\'); return false;">Sign up</a></p>' :
-          '<p>Already have an account? <a href="#" onclick="switchAuthMode(\'signin\'); return false;">Sign in</a></p>'
-        }
+      <div class="auth-footer-modern">
+        ${isSignIn ?
+      'Don\'t have an account? <button onclick="switchAuthMode(\'signup\')">Create one</button>' :
+      'Already have an account? <button onclick="switchAuthMode(\'signin\')">Sign in</button>'
+    }
       </div>
     </div>
   `;
-  
-  modalTitle.textContent = title;
+
+  modalTitle.textContent = ''; // Hide default title as we have a custom header
   modalContent.innerHTML = content;
+  const modalEl = document.getElementById('modal');
+  if (modalEl) modalEl.classList.add('modal-auth-variant');
   modalOverlay.classList.add('active');
 }
 
@@ -536,144 +838,225 @@ function switchAuthMode(mode) {
   renderAuthModal();
 }
 
+async function handleGoogleSignIn() {
+  const googleBtn = document.querySelector('.google-auth-btn-modern');
+  const originalContent = googleBtn?.innerHTML;
+
+  try {
+    // Show loading state
+    if (googleBtn) {
+      googleBtn.disabled = true;
+      googleBtn.innerHTML = `
+        <svg class="spinner" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10" opacity="0.25"/>
+          <path d="M12 2a10 10 0 0 1 10 10" opacity="0.75"/>
+        </svg>
+        <span>Connecting...</span>
+      `;
+    }
+
+    // Initiate Google OAuth
+    await window.LayerDB.signInWithGoogle();
+    // User will be redirected to Google, then back to app
+
+  } catch (error) {
+    console.error('Google sign in error:', error);
+
+    // Restore button state
+    if (googleBtn && originalContent) {
+      googleBtn.disabled = false;
+      googleBtn.innerHTML = originalContent;
+    }
+
+    // Show user-friendly error
+    let errorMessage = 'Failed to sign in with Google';
+    if (error.message?.includes('popup')) {
+      errorMessage = 'Popup blocked. Please allow popups for this site.';
+    } else if (error.message?.includes('redirect')) {
+      errorMessage = 'Redirect failed. Please check your configuration.';
+    }
+
+    showAuthError(errorMessage);
+  }
+}
+
 async function handleAuthSubmit(event) {
   event.preventDefault();
-  
+
   const email = document.getElementById('authEmail').value.trim();
   const password = document.getElementById('authPassword').value;
   const errorEl = document.getElementById('authError');
   const submitBtn = event.target.querySelector('button[type="submit"]');
-  
+
   // Clear previous errors
   errorEl.style.display = 'none';
-  
-  // Disable submit button during processing
+
+  // Disable button during submission
   if (submitBtn) {
     submitBtn.disabled = true;
-    submitBtn.textContent = authMode === 'signin' ? 'Signing in...' : 'Creating account...';
+    const btnText = submitBtn.querySelector('span');
+    if (btnText) {
+      btnText.textContent = authMode === 'signup' ? 'Creating Account...' : 'Signing In...';
+    } else {
+      submitBtn.textContent = authMode === 'signup' ? 'Creating Account...' : 'Signing In...';
+    }
   }
-  
+
   try {
     if (authMode === 'signup') {
       const username = document.getElementById('authUsername').value.trim();
       const confirmPassword = document.getElementById('authConfirmPassword').value;
-      
+
       // Validation
       if (!email || !username || !password || !confirmPassword) {
         showAuthError('Please fill in all fields');
         return;
       }
-      
+
       if (password !== confirmPassword) {
         showAuthError('Passwords do not match');
         return;
       }
-      
+
       if (password.length < 6) {
         showAuthError('Password must be at least 6 characters');
         return;
       }
-      
-      // Use Supabase for signup
-      if (window.LayerDB && window.LayerDB.signUp) {
-        const data = await window.LayerDB.signUp(email, password);
-        
-        // Store username in localStorage temporarily (will be synced to profile)
-        localStorage.setItem('layerPendingUsername', username);
-        
-        closeModal();
-        
-        // Show success message
-        alert('Account created! Please check your email to confirm your account, then sign in.');
-      } else {
-        // Fallback to localStorage if Supabase not available
-        const users = JSON.parse(localStorage.getItem('layerUsers') || '[]');
-        if (users.find(u => u.email === email)) {
-          showAuthError('An account with this email already exists');
-          return;
+
+      // Use Supabase Auth for signup
+      const { data, error } = await window.LayerDB.supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          data: {
+            name: username
+          },
+          emailRedirectTo: window.location.origin + '/layer.html'
         }
-        const newUser = {
-          id: Date.now().toString(),
-          email,
-          username,
-          createdAt: new Date().toISOString()
-        };
-        users.push(newUser);
-        localStorage.setItem('layerUsers', JSON.stringify(users));
-        localStorage.setItem('layerCurrentUser', JSON.stringify(newUser));
-        closeModal();
-        updateUserDisplay(newUser);
+      });
+
+      if (error) {
+        console.error('Signup error:', error);
+        showAuthError(error.message || 'Failed to create account');
+        return;
       }
-      
+
+      if (data.user && !data.session) {
+        // Email confirmation required
+        closeModal();
+        showNotification('Check your email to confirm your account!', 'success');
+        return;
+      }
+
+      // Successfully signed up and logged in
+      closeModal();
+      await loadUserDataFromDB();
+      updateUserDisplay({ username: username, email: email });
+      showNotification('Account created successfully!', 'success');
+      renderCurrentView();
+
     } else {
-      // Sign In
+      // Sign In with Supabase
       if (!email || !password) {
         showAuthError('Please enter your email and password');
         return;
       }
-      
-      // Use Supabase for signin
-      if (window.LayerDB && window.LayerDB.signIn) {
-        const data = await window.LayerDB.signIn(email, password);
-        
-        const user = data.user;
-        const displayUser = {
-          id: user.id,
-          email: user.email,
-          username: user.email.split('@')[0],
-          name: user.email.split('@')[0]
-        };
-        
-        localStorage.setItem('layerCurrentUser', JSON.stringify(displayUser));
-        closeModal();
-        updateUserDisplay(displayUser);
-        
-        // Sync data from Supabase after login
-        await syncDataFromSupabase();
-        renderCurrentView();
-        
-      } else {
-        // Fallback to localStorage
-        const users = JSON.parse(localStorage.getItem('layerUsers') || '[]');
-        const user = users.find(u => u.email === email);
-        
-        if (!user) {
+
+      const { data, error } = await window.LayerDB.supabase.auth.signInWithPassword({
+        email,
+        password
+      });
+
+      if (error) {
+        console.error('Sign in error:', error);
+        if (error.message.includes('Invalid login credentials')) {
           showAuthError('Invalid email or password');
-          return;
+        } else if (error.message.includes('Email not confirmed')) {
+          showAuthError('Please confirm your email before signing in');
+        } else {
+          showAuthError(error.message || 'Failed to sign in');
         }
-        
-        localStorage.setItem('layerCurrentUser', JSON.stringify(user));
-        closeModal();
-        updateUserDisplay(user);
+        return;
       }
+
+      closeModal();
+      // Ensure profile exists for newly signed in user
+      try {
+        await window.LayerDB.ensureUserProfile();
+      } catch (profileError) {
+        console.error('Failed to ensure user profile after sign in:', profileError);
+      }
+      await loadUserDataFromDB();
+      const username = data.user?.user_metadata?.name || data.user?.email?.split('@')[0] || 'User';
+      await updateUserDisplay({ username: username, email: data.user.email });
+      showNotification('Signed in successfully!', 'success');
+      renderCurrentView();
     }
-  } catch (error) {
-    console.error('Auth error:', error);
-    showAuthError(error.message || 'Authentication failed. Please try again.');
+  } catch (err) {
+    console.error('Auth error:', err);
+    showAuthError('An unexpected error occurred. Please try again.');
   } finally {
-    // Re-enable submit button
+    // Re-enable button
     if (submitBtn) {
       submitBtn.disabled = false;
-      submitBtn.textContent = authMode === 'signin' ? 'Sign In' : 'Create Account';
+      submitBtn.textContent = authMode === 'signup' ? 'Create Account' : 'Sign In';
     }
   }
 }
 
 function showAuthError(message) {
   const errorEl = document.getElementById('authError');
+  if (!errorEl) return;
   errorEl.textContent = message;
   errorEl.style.display = 'block';
+
+  // Re-enable submit button if it exists
+  const submitBtn = document.querySelector('.auth-submit-btn');
+  if (submitBtn) {
+    submitBtn.disabled = false;
+    const btnText = submitBtn.querySelector('span');
+    if (btnText) {
+      btnText.textContent = authMode === 'signup' ? 'Create Account' : 'Sign In';
+    }
+  }
 }
 
-function updateUserDisplay(user) {
-  const signInBtn = document.getElementById('signInBtn');
-  if (signInBtn && user) {
-    const initials = user.username.slice(0, 2).toUpperCase();
-    signInBtn.outerHTML = `
+async function updateUserDisplay(user) {
+  console.log('Updating user display:', user);
+
+  let signInBtn = document.getElementById('signInBtn');
+  let userInfo = document.getElementById('userInfo');
+
+  // If user is logged in
+  if (user && user.email) {
+    const displayName = user.username || user.email?.split('@')[0] || 'User';
+    const initials = displayName.slice(0, 2).toUpperCase();
+
+    // Try to get user profile for avatar
+    let avatarElement = `<div class="user-avatar">${initials}</div>`;
+
+    try {
+      if (window.LayerDB && typeof window.LayerDB.getProfile === 'function') {
+        const profile = await window.LayerDB.getProfile();
+        if (profile && profile.avatar_url) {
+          // Use Google avatar if available
+          avatarElement = `<img class="user-avatar-img" src="${profile.avatar_url}" alt="${displayName}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">` +
+            `<div class="user-avatar fallback" style="display:none;">${initials}</div>`;
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to load user profile for avatar:', error);
+      // Fall back to initials
+    }
+
+    const userInfoHTML = `
       <div class="user-info" id="userInfo">
-        <div class="user-avatar">${initials}</div>
-        <span class="user-name">${user.username}</span>
-        <button class="sign-out-btn" onclick="signOut()" title="Sign Out">
+        <div class="user-avatar-wrapper">
+          ${avatarElement}
+          <div class="user-status-indicator" title="Connected to database"></div>
+        </div>
+        <span class="user-name">${displayName}</span>
+        <button class="sign-out-btn" onclick="signOutUser()" title="Sign Out">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
             <polyline points="16 17 21 12 16 7"/>
@@ -682,149 +1065,382 @@ function updateUserDisplay(user) {
         </button>
       </div>
     `;
+
+    if (signInBtn) {
+      // Replace sign in button with user info
+      signInBtn.outerHTML = userInfoHTML;
+    } else if (userInfo) {
+      // Update existing user info
+      userInfo.outerHTML = userInfoHTML;
+    } else {
+      console.warn('Neither signInBtn nor userInfo found in DOM');
+    }
   }
 }
 
-async function signOut() {
+async function signOutUser() {
   try {
-    // Sign out from Supabase
-    if (window.LayerDB && window.LayerDB.signOut) {
-      await window.LayerDB.signOut();
+    await window.LayerDB.supabase.auth.signOut();
+
+    // CRITICAL: Clear ALL user-specific localStorage data to ensure data privacy
+    const keysToRemove = [
+      'layerProjectsData',
+      'layerBacklogTasks',
+      'layerMyIssues',
+      'layerCalendarEvents',
+      'layerDocs',
+      'layerExcels',
+      'layerSpaces',
+      'layerSpaceChecklists',
+      'layerRecurringTasks',
+      'layerCurrentUser',
+      'layerAssignments'
+    ];
+    keysToRemove.forEach(key => localStorage.removeItem(key));
+
+    const userInfo = document.getElementById('userInfo');
+    if (userInfo) {
+      userInfo.outerHTML = `
+        <button class="sign-in-btn" id="signInBtn" onclick="openAuthModal()">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+            <polyline points="10 17 15 12 10 7"/>
+            <line x1="15" y1="12" x2="3" y2="12"/>
+          </svg>
+          <span>Sign In</span>
+        </button>
+      `;
     }
+
+    showNotification('Signed out successfully', 'info');
+    // Clear spaces and favorites from sidebar immediately
+    if (typeof renderSpacesInSidebar === 'function') {
+      renderSpacesInSidebar();
+    }
+    if (typeof renderFavoritesInSidebar === 'function') {
+      renderFavoritesInSidebar();
+    }
+    renderCurrentView();
   } catch (error) {
     console.error('Sign out error:', error);
+    showNotification('Failed to sign out', 'error');
   }
-  
-  // Clear local user data
-  localStorage.removeItem('layerCurrentUser');
-  
-  // Clear all cached data to ensure fresh load on next login
-  localStorage.removeItem('layerCalendarEvents');
-  localStorage.removeItem('layerProjectsData');
-  localStorage.removeItem('layerMyIssues');
-  localStorage.removeItem('layerBacklogTasks');
-  localStorage.removeItem('layerDocs');
-  localStorage.removeItem('layerExcels');
-  localStorage.removeItem('layerSpaces');
-  localStorage.removeItem('layerRecurringTasks');
-  
-  const userInfo = document.getElementById('userInfo');
-  if (userInfo) {
-    userInfo.outerHTML = `
-      <button class="sign-in-btn" id="signInBtn" onclick="openAuthModal()">
-        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
-          <polyline points="10 17 15 12 10 7"/>
-          <line x1="15" y1="12" x2="3" y2="12"/>
-        </svg>
-        <span>Sign In</span>
-      </button>
-    `;
+}
+
+// Load user data from database after login
+async function loadUserDataFromDB() {
+  try {
+    const user = window.LayerDB.getCurrentUser();
+    if (!user) {
+      console.log('No user authenticated, skipping DB load');
+      return;
+    }
+
+    console.log('Loading user data from database for:', user.email);
+
+    // CRITICAL: Clear existing localStorage before loading new user's data
+    // This ensures no data leakage between users
+    localStorage.removeItem('layerProjectsData');
+    localStorage.removeItem('layerBacklogTasks');
+    localStorage.removeItem('layerMyIssues');
+    localStorage.removeItem('layerCalendarEvents');
+    localStorage.removeItem('layerDocs');
+    localStorage.removeItem('layerExcels');
+    localStorage.removeItem('layerSpaces');
+    // Also clear old favorites arrays (now stored in docs/excels)
+    localStorage.removeItem('layerFavorites');
+    localStorage.removeItem('layerFavoriteDocs');
+    localStorage.removeItem('layerExcelFavorites');
+    localStorage.removeItem('layerFavoriteExcels');
+
+    // Load all user data from Supabase (including calendar events, docs, excels, spaces)
+    const [projects, backlogTasks, issues, calendarEvents, docs, excels, spaces] = await Promise.all([
+      window.LayerDB.loadProjects(),
+      window.LayerDB.loadBacklogTasks(),
+      window.LayerDB.loadIssues(),
+      window.LayerDB.loadCalendarEvents(),
+      window.LayerDB.loadDocs(),
+      window.LayerDB.loadExcels(),
+      window.LayerDB.loadSpaces()
+    ]);
+
+    // Cache in localStorage for synchronous access by render functions
+    localStorage.setItem('layerProjectsData', JSON.stringify(projects || []));
+    localStorage.setItem('layerBacklogTasks', JSON.stringify(backlogTasks || []));
+    localStorage.setItem('layerMyIssues', JSON.stringify(issues || []));
+    localStorage.setItem('layerCalendarEvents', JSON.stringify(calendarEvents || []));
+    localStorage.setItem('layerDocs', JSON.stringify(docs || []));
+    localStorage.setItem('layerExcels', JSON.stringify(excels || []));
+    localStorage.setItem('layerSpaces', JSON.stringify(spaces || []));
+
+    // Cache checklists from spaces
+    const checklists = {};
+    spaces.forEach(space => {
+      if (space.checklist && space.checklist.length > 0) {
+        checklists[String(space.id)] = space.checklist;
+      }
+    });
+    localStorage.setItem('layerSpaceChecklists', JSON.stringify(checklists));
+
+    console.log('User data loaded from database:', {
+      projects: projects?.length || 0,
+      backlogTasks: backlogTasks?.length || 0,
+      issues: issues?.length || 0,
+      calendarEvents: calendarEvents?.length || 0,
+      docs: docs?.length || 0,
+      excels: excels?.length || 0,
+      spaces: spaces?.length || 0
+    });
+
+    // Render spaces in sidebar immediately after loading
+    if (typeof renderSpacesInSidebar === 'function') {
+      renderSpacesInSidebar();
+    }
+
+    // Render favorites in sidebar immediately after loading
+    if (typeof renderFavoritesInSidebar === 'function') {
+      renderFavoritesInSidebar();
+    }
+
+    // Initialize presence tracking
+    if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+      // Update presence on load
+      window.LayerDB.updatePresence(true, null).catch(console.error);
+
+      // Update presence every 30 seconds to keep user online
+      setInterval(() => {
+        if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+          window.LayerDB.updatePresence(true, null).catch(console.error);
+        }
+      }, 30000);
+    }
+
+    // Initialize realtime subscriptions for live updates
+    setupRealtimeSubscription();
+
+    // 🚀 BACKGROUND LOAD: Preload DM messages for instant team chat access
+    // Start this in background after main data is loaded
+    setTimeout(() => {
+      if (typeof preloadTeamDMMessages === 'function') {
+        preloadTeamDMMessages();
+      }
+    }, 1000); // Start after 1 second to not block main UI
+  } catch (error) {
+    console.error('Failed to load user data:', error);
+    // On error, ensure empty arrays so user sees clean state
+    localStorage.setItem('layerProjectsData', '[]');
+    localStorage.setItem('layerBacklogTasks', '[]');
+    localStorage.setItem('layerMyIssues', '[]');
+    localStorage.setItem('layerCalendarEvents', '[]');
+    localStorage.setItem('layerDocs', '[]');
+    localStorage.setItem('layerExcels', '[]');
+    localStorage.setItem('layerSpaces', '[]');
+    localStorage.setItem('layerSpaceChecklists', '{}');
+
+    // Clear spaces and favorites from sidebar on error
+    if (typeof renderSpacesInSidebar === 'function') {
+      renderSpacesInSidebar();
+    }
+    if (typeof renderFavoritesInSidebar === 'function') {
+      renderFavoritesInSidebar();
+    }
   }
-  
-  // Re-render to show empty state (no user data)
-  renderCurrentView();
 }
 
 async function checkExistingSession() {
-  // Initialize Supabase auth if available
-  if (window.LayerDB && window.LayerDB.initAuth) {
-    try {
-      const { user, session } = await window.LayerDB.initAuth();
-      
-      if (user) {
-        // User is logged in via Supabase
-        localStorage.setItem('layerCurrentUser', JSON.stringify({
-          name: user.email.split('@')[0],
-          email: user.email,
-          id: user.id
-        }));
-        updateUserDisplay({ name: user.email.split('@')[0], email: user.email });
+  try {
+    // Initialize Supabase auth and check for existing session
+    const { user, session } = await window.LayerDB.initAuth();
+
+    // Always check for URL parameters (invitations) even if not logged in yet
+    // handleUrlParameters will redirect to login if needed
+    await handleUrlParameters();
+
+    if (user && session) {
+      console.log('User session found:', user.email);
+
+      // Ensure profile exists for existing sessions too
+      try {
+        await window.LayerDB.ensureUserProfile();
+      } catch (profileError) {
+        console.error('Failed to ensure user profile for existing session:', profileError);
+      }
+
+      // For Google OAuth users, check if username exists in database
+      const username = user.user_metadata?.name || user.email?.split('@')[0] || 'User';
+
+      // Load user data from database
+      await loadUserDataFromDB();
+
+      // Update UI with user info
+      await updateUserDisplay({ username: username, email: user.email });
+
+      renderCurrentView();
+    }
+
+    // Listen for auth state changes
+    window.addEventListener('authStateChanged', async (event) => {
+      const { user: authUser, session: authSession, event: authEvent } = event.detail;
+
+      console.log('Auth state changed:', authEvent, authUser?.email);
+
+      if (authUser && authSession) {
+        // User signed in - ensure profile exists
+        try {
+          await window.LayerDB.ensureUserProfile();
+        } catch (profileError) {
+          console.error('Failed to ensure user profile:', profileError);
+          // Continue anyway as the app might still work
+        }
+
+        // Only update UI and show notifications on actual auth changes, not token refreshes
+        console.log('🔍 Auth event type:', authEvent, 'Checking if should show welcome...');
         
-        // Sync data from Supabase to localStorage
-        await syncDataFromSupabase();
+        // User signed in
+        const username = authUser.user_metadata?.name || authUser.email?.split('@')[0] || 'User';
         
-        // Re-render to show synced data
+        // List of events that should trigger welcome message and UI updates
+        const welcomeEvents = ['SIGNED_IN', 'INITIAL_SESSION'];
+        // List of refresh events that should NOT trigger any UI updates
+        const refreshEvents = ['TOKEN_REFRESHED', 'REFRESHED', 'UPDATED'];
+        
+        if (welcomeEvents.includes(authEvent)) {
+          console.log('✅ Processing auth change for event:', authEvent);
+          
+          // Set up realtime subscription for projects only on actual sign-in
+          setupRealtimeSubscription();
+          
+          // Load user data only on actual sign-in
+          await loadUserDataFromDB();
+
+          // Initialize realtime subscriptions only on actual sign-in
+          if (typeof initializeRealtimeSubscriptions === 'function') {
+            await initializeRealtimeSubscriptions();
+          }
+          
+          // Update UI
+          await updateUserDisplay({ username: username, email: authUser.email });
+
+          // Close any open modals
+          closeModal();
+
+          // Show success notification
+          showNotification(`Welcome back, ${username}!`, 'success');
+
+          // Send welcome email to user's Google account
+          if (window.LayerDB && typeof window.LayerDB.sendWelcomeEmail === 'function') {
+            try {
+              await window.LayerDB.sendWelcomeEmail(authUser.email, username);
+            } catch (error) {
+              console.error('Failed to send welcome email:', error);
+            }
+          }
+
+          // Handle project invitation after sign in
+          await handleUrlParameters();
+
+          // Re-render the entire view
+          renderCurrentView();
+        } else if (refreshEvents.includes(authEvent)) {
+          console.log('🔄 Skipping ALL UI updates for refresh event:', authEvent);
+          // Do absolutely nothing on refresh events
+        } else {
+          console.log('❓ Unknown auth event type:', authEvent, ' - skipping UI updates to be safe');
+        }
+      } else {
+        // User signed out
+        console.log('User signed out');
+
+        // Cleanup realtime subscriptions
+        if (typeof cleanupRealtimeSubscriptions === 'function') {
+          cleanupRealtimeSubscriptions();
+        }
+
+        const userInfo = document.getElementById('userInfo');
+        if (userInfo) {
+          userInfo.outerHTML = `
+            <button class="sign-in-btn" id="signInBtn" onclick="openAuthModal()">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+                <polyline points="10 17 15 12 10 7"/>
+                <line x1="15" y1="12" x2="3" y2="12"/>
+              </svg>
+              <span>Sign In</span>
+            </button>
+          `;
+        }
         renderCurrentView();
       }
-      
-      // Listen for auth state changes
-      window.addEventListener('authStateChanged', async (event) => {
-        const { user: authUser, event: authEvent } = event.detail;
-        
-        if (authEvent === 'SIGNED_IN' && authUser) {
-          localStorage.setItem('layerCurrentUser', JSON.stringify({
-            name: authUser.email.split('@')[0],
-            email: authUser.email,
-            id: authUser.id
-          }));
-          updateUserDisplay({ name: authUser.email.split('@')[0], email: authUser.email });
-          
-          // Sync data from Supabase
-          await syncDataFromSupabase();
-          renderCurrentView();
-        } else if (authEvent === 'SIGNED_OUT') {
-          localStorage.removeItem('layerCurrentUser');
-          updateUserDisplay(null);
-          renderCurrentView();
-        }
-      });
-      
-    } catch (err) {
-      console.error('Failed to initialize Supabase auth:', err);
-      // Fall back to localStorage session
-      const currentUser = localStorage.getItem('layerCurrentUser');
-      if (currentUser) {
-        updateUserDisplay(JSON.parse(currentUser));
-      }
-    }
-  } else {
-    // Supabase not available, use localStorage
-    const currentUser = localStorage.getItem('layerCurrentUser');
-    if (currentUser) {
-      updateUserDisplay(JSON.parse(currentUser));
-    }
+    });
+  } catch (error) {
+    console.error('Session check error:', error);
   }
 }
 
-// Sync all data from Supabase to localStorage
-async function syncDataFromSupabase() {
-  if (!window.LayerDB || !window.LayerDB.isAuthenticated()) return;
-  
+/**
+ * Handles project invitations and specific project views via URL parameters
+ */
+async function handleUrlParameters() {
+  const urlParams = new URLSearchParams(window.location.search);
+  const projectId = urlParams.get('project');
+
+  if (!projectId) return;
+
+  console.log('Handling URL parameters for project:', projectId);
+
   try {
-    console.log('Syncing data from Supabase...');
-    
-    // Sync calendar events - always update localStorage with what's in Supabase
-    const events = await window.LayerDB.loadCalendarEvents();
-    localStorage.setItem('layerCalendarEvents', JSON.stringify(events || []));
-    
-    // Sync projects
-    const projects = await window.LayerDB.loadProjects();
-    localStorage.setItem('layerProjectsData', JSON.stringify(projects || []));
-    
-    // Sync issues
-    const issues = await window.LayerDB.loadIssues();
-    localStorage.setItem('layerMyIssues', JSON.stringify(issues || []));
-    
-    // Sync backlog tasks
-    const backlog = await window.LayerDB.loadBacklogTasks();
-    localStorage.setItem('layerBacklogTasks', JSON.stringify(backlog || []));
-    
-    // Sync docs
-    const docs = await window.LayerDB.loadDocs();
-    localStorage.setItem('layerDocs', JSON.stringify(docs || []));
-    
-    // Sync excels
-    const excels = await window.LayerDB.loadExcels();
-    localStorage.setItem('layerExcels', JSON.stringify(excels || []));
-    
-    // Sync spaces
-    const spaces = await window.LayerDB.loadSpaces();
-    localStorage.setItem('layerSpaces', JSON.stringify(spaces || []));
-    
-    console.log('Data sync complete!');
-  } catch (err) {
-    console.error('Failed to sync data from Supabase:', err);
+    // Check authentication
+    if (!window.LayerDB || !window.LayerDB.isAuthenticated()) {
+      console.log('User not authenticated, showing login for project invitation');
+      // Store project ID to show info in auth modal if we want
+      window.pendingProjectInvite = projectId;
+
+      // Open auth modal after a small delay to ensure UI is ready
+      setTimeout(() => {
+        if (typeof openAuthModal === 'function') {
+          openAuthModal();
+          showNotification('Please sign in to join the project', 'info');
+        }
+      }, 500);
+      return;
+    }
+
+    // 1. Try to find the project in already loaded projects
+    let projects = loadProjects();
+    let index = projects.findIndex(p => p.id === projectId);
+
+    if (index === -1) {
+      // 2. If not found, try to join if invited
+      showNotification('Checking invitation...', 'info');
+      const joinResult = await window.LayerDB.checkInvitationAndJoin(projectId);
+
+      if (joinResult.success) {
+        showNotification(joinResult.message, 'success');
+        // Reload projects to include the newly joined one
+        await loadUserDataFromDB();
+        projects = loadProjects();
+        index = projects.findIndex(p => p.id === projectId);
+      } else {
+        console.warn('Could not join project:', joinResult.error);
+        showNotification(joinResult.error || 'Project not found or no invitation', 'error');
+        // Clean up URL if invitation is invalid to avoid infinite loops/confusion
+        const newUrl = window.location.pathname;
+        window.history.replaceState({}, document.title, newUrl);
+        return;
+      }
+    }
+
+    // 3. Open project detail
+    if (index !== -1) {
+      selectedProjectIndex = index;
+      currentView = 'activity'; // Ensure we are in project view mode
+
+      // Clean up URL without refreshing
+      const newUrl = window.location.pathname;
+      window.history.replaceState({}, document.title, newUrl);
+    }
+  } catch (error) {
+    console.error('Error handling URL parameters:', error);
   }
 }
 
@@ -858,23 +1474,170 @@ function restoreScheduleScrollPosition() {
   });
 }
 
+// ============================================
+// Async Profile Loading for Project Detail View
+// ============================================
+async function loadProjectDetailProfiles(projectIndex) {
+  const projects = loadProjects();
+  const project = projects[projectIndex];
+  if (!project || !window.LayerDB || !window.LayerDB.isAuthenticated()) return;
+
+  // 1. Collect all user IDs we need (owner + task completers + team members)
+  const userIds = new Set();
+  userIds.add(project.user_id);
+  
+  if (project.columns) {
+    project.columns.forEach(col => {
+      col.tasks.forEach(task => {
+        if (task.completed_by) userIds.add(task.completed_by);
+      });
+    });
+  }
+  
+  if (project.projectMembers) {
+    project.projectMembers.forEach(m => {
+      if (m.user_id) userIds.add(m.user_id);
+    });
+  }
+
+  // 2. Batch fetch all profiles
+  try {
+    await window.LayerDB.fetchProfiles(Array.from(userIds));
+  } catch (e) {
+    console.error('Failed to batch fetch profiles:', e);
+    return;
+  }
+
+  // 3. Update Lead display
+  const ownerProfile = window.LayerDB.getCachedProfile(project.user_id);
+  const leadValueEl = document.getElementById('projectLeadValue');
+  if (leadValueEl && ownerProfile) {
+    const displayName = ownerProfile.name || ownerProfile.email?.split('@')[0] || 'Unknown';
+    if (ownerProfile.avatar_url) {
+      leadValueEl.innerHTML = `
+        <img src="${ownerProfile.avatar_url}" alt="${displayName}" style="width:24px;height:24px;border-radius:50%;object-fit:cover;border:1.5px solid var(--border);" onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+        <div class="member-avatar" style="width:24px;height:24px;font-size:12px;background:${getNameColor(displayName)};color:white;border-radius:50%;display:none;align-items:center;justify-content:center;">${displayName.charAt(0).toUpperCase()}</div>
+        <span style="color:var(--foreground);">${displayName}</span>
+      `;
+    } else {
+      const fallbackHtml = `<div class="member-avatar" style="width:24px;height:24px;font-size:12px;background:${getNameColor(displayName)};color:white;border-radius:50%;display:flex;align-items:center;justify-content:center;">${displayName.charAt(0).toUpperCase()}</div>`;
+      leadValueEl.innerHTML = `${fallbackHtml}<span style="color:var(--foreground);">${displayName}</span>`;
+    }
+  }
+
+  // 4. Update team member list avatars
+  document.querySelectorAll('.team-member-avatar[data-user-id]').forEach(el => {
+    const userId = el.getAttribute('data-user-id');
+    const profile = window.LayerDB.getCachedProfile(userId);
+    if (profile) {
+      const name = profile.name || profile.email?.split('@')[0] || 'User';
+      if (profile.avatar_url) {
+        el.innerHTML = `<img src="${profile.avatar_url}" alt="${name}" style="width:100%;height:100%;border-radius:50%;object-fit:cover;display:block;" onerror="this.style.display='none';this.parentElement.innerHTML='${name.charAt(0).toUpperCase()}'">`;
+        el.style.background = 'transparent';
+      } else {
+        el.innerHTML = name.charAt(0).toUpperCase();
+        el.style.background = getNameColor(name);
+        el.style.color = 'white';
+        el.style.display = 'flex';
+        el.style.alignItems = 'center';
+        el.style.justifyContent = 'center';
+      }
+    }
+  });
+
+  // 5. Update task completer avatars
+  document.querySelectorAll('.pd-task-completer-avatar[data-completer-id]').forEach(el => {
+    const userId = el.getAttribute('data-completer-id');
+    const profile = window.LayerDB.getCachedProfile(userId);
+    if (profile) {
+      const name = profile.name || profile.email?.split('@')[0] || 'User';
+      el.title = `Completed by ${name}`;
+      if (profile.avatar_url) {
+        el.innerHTML = `<img src="${profile.avatar_url}" alt="${name}" style="width:100%;height:100%;border-radius:50%;object-fit:cover;" onerror="this.style.display='none';this.parentElement.innerHTML='${name.charAt(0).toUpperCase()}'">`;
+        el.style.background = 'transparent';
+      } else {
+        el.innerHTML = name.charAt(0).toUpperCase();
+        el.style.background = getNameColor(name);
+        el.style.color = 'white';
+        el.style.fontSize = '10px';
+        el.style.fontWeight = '600';
+        el.style.display = 'flex';
+        el.style.alignItems = 'center';
+        el.style.justifyContent = 'center';
+      }
+    }
+  });
+}
+
 // Render current view with optional scroll preservation
-function renderCurrentView(preserveScroll = false) {
+async function renderCurrentView(preserveScroll = false) {
+  // Create a context signature for this render
+  const renderContext = `${currentView}_${selectedProjectIndex}_${currentProjectTab}`;
+
+  // Debounce rapid renders
+  const now = Date.now();
+  if ((now - lastRenderTime < RENDER_DEBOUNCE) && lastRenderContext === renderContext) {
+    // Skip rendering if called too rapidly with same context
+    return;
+  }
+  lastRenderTime = now;
+  lastRenderContext = renderContext;
+
   // Save scroll position if we're on schedule view and preserving scroll
   if (preserveScroll && currentView === 'schedule') {
     saveScheduleScrollPosition();
   }
-  
-  if (selectedProjectIndex !== null) {
+
+  // Only render project detail view if current view is not project-specific
+  if (selectedProjectIndex !== null && currentView !== 'schedule') {
     viewsContainer.innerHTML = renderProjectDetailView(selectedProjectIndex);
     updateBreadcrumb('Project Details');
+
+    // Setup project-specific realtime subscription for live updates
+    const projects = loadProjects();
+    const currentProject = projects[selectedProjectIndex];
+    if (currentProject && currentProject.id) {
+      setupProjectDetailRealtime(currentProject.id);
+    }
+
+    // Async load profiles for lead and task completion avatars
+    loadProjectDetailProfiles(selectedProjectIndex);
+
+    // Switch to the current project tab after rendering, with a small delay
+    // Only do this if we're not already on the correct tab
+    setTimeout(() => {
+      if (typeof switchProjectTab === 'function' && typeof currentProjectTab !== 'undefined') {
+        // Check if we need to switch tabs (avoid unnecessary switching)
+        const currentActiveTab = document.querySelector('.pd-tab.active');
+        if (!currentActiveTab || currentActiveTab.dataset.tab !== currentProjectTab) {
+          switchProjectTab(currentProjectTab, selectedProjectIndex);
+        }
+      }
+    }, 50);
+
     return;
+  }
+
+  // Cleanup project detail realtime when not viewing a project
+  if (typeof cleanupProjectDetailRealtime === 'function') {
+    cleanupProjectDetailRealtime();
+  }
+
+  // Stop shared content polling when leaving inbox view
+  if (currentView !== 'inbox' && typeof stopSharedContentPolling === 'function') {
+    stopSharedContentPolling();
   }
 
   switch (currentView) {
     case 'inbox':
       viewsContainer.innerHTML = renderInboxView();
       updateBreadcrumb('Inbox');
+      // Apply saved widget order after rendering
+      initDashboardWidgetOrder();
+      // Start shared content polling for real-time updates
+      if (typeof initializeSharedContentWidget === 'function') {
+        initializeSharedContentWidget();
+      }
       break;
     case 'my-issues':
       viewsContainer.innerHTML = renderMyIssuesView(currentFilter, searchQuery);
@@ -918,7 +1681,7 @@ function renderCurrentView(preserveScroll = false) {
       viewsContainer.innerHTML = renderMyIssuesView();
       updateBreadcrumb('My issues');
   }
-  
+
   // Restore saved left panel width
   const savedWidth = loadLeftPanelWidth();
   if (savedWidth) {
@@ -926,7 +1689,7 @@ function renderCurrentView(preserveScroll = false) {
       panel.style.width = savedWidth + 'px';
     });
   }
-  
+
   // Setup resize observer for left panels
   setTimeout(() => {
     document.querySelectorAll('.tl-left-panel-clickup').forEach(panel => {
@@ -958,28 +1721,34 @@ function setupIssueFilterListeners() {
 // Issue Handlers
 // ============================================
 function openCreateIssueModal() {
+  // Require authentication to create issues
+  if (!window.LayerDB || !window.LayerDB.isAuthenticated()) {
+    showNotification('Please sign in to create issues', 'error');
+    openAuthModal();
+    return;
+  }
   openModal('Create New Issue', renderCreateIssueModalContent());
 }
 
-function handleCreateIssueSubmit(event) {
+async function handleCreateIssueSubmit(event) {
   event.preventDefault();
   const form = event.target;
   const formData = new FormData(form);
-  
+
   const title = formData.get('title');
   const description = formData.get('description');
   const priority = formData.get('priority');
   const status = formData.get('status');
-  
+
   if (title.trim()) {
-    addIssue({
+    closeModal();
+    await addIssue({
       title: title.trim(),
       description: description.trim(),
       priority,
       status,
       assignee: 'Zeyad Maher'
     });
-    closeModal();
     renderCurrentView();
   }
 }
@@ -987,16 +1756,16 @@ function handleCreateIssueSubmit(event) {
 // ============================================
 // Backlog Handlers
 // ============================================
-function promptAddBacklogTask() {
+async function promptAddBacklogTask() {
   const title = prompt('New backlog task:', '');
   if (title?.trim()) {
-    addBacklogTask(title.trim());
+    await addBacklogTask(title.trim());
     renderCurrentView();
   }
 }
 
-function handleToggleBacklogTask(index) {
-  toggleBacklogTask(index);
+async function handleToggleBacklogTask(index) {
+  await toggleBacklogTask(index);
   renderCurrentView();
 }
 
@@ -1004,20 +1773,20 @@ function handleUpdateBacklogTask(index, title) {
   updateBacklogTask(index, title || 'New task');
 }
 
-function handleDeleteBacklogTask(index) {
+async function handleDeleteBacklogTask(index) {
   if (confirm('Delete this task?')) {
-    deleteBacklogTask(index);
+    await deleteBacklogTask(index);
     renderCurrentView();
   }
 }
 
-function handleQuickAddKeypress(event) {
+async function handleQuickAddKeypress(event) {
   if (event.key === 'Enter') {
     const input = event.target;
     const title = input.value.trim();
     if (title) {
-      addBacklogTask(title);
       input.value = '';
+      await addBacklogTask(title);
       renderCurrentView();
     }
   }
@@ -1027,28 +1796,41 @@ function handleQuickAddKeypress(event) {
 // Project Handlers
 // ============================================
 function openCreateProjectModal() {
+  // Require authentication to create projects
+  if (!window.LayerDB || !window.LayerDB.isAuthenticated()) {
+    showNotification('Please sign in to create projects', 'error');
+    openAuthModal();
+    return;
+  }
   openModal('Create new project', renderCreateProjectModalContent());
 }
 
-function handleCreateProjectSubmit(event) {
+async function handleCreateProjectSubmit(event) {
   event.preventDefault();
   const form = event.target;
   const formData = new FormData(form);
-  
+
   const name = formData.get('name');
   const targetDate = formData.get('targetDate');
   const description = formData.get('description');
-  
+
   if (name.trim() && targetDate) {
-    addProject({
+    console.log('Starting project creation...');
+    closeModal();
+    const newProject = await addProject({
       name: name.trim(),
       status: 'todo',
       startDate: new Date().toISOString().split('T')[0],
       targetDate,
       description: description.trim()
     });
-    closeModal();
-    renderCurrentView();
+    console.log('Project creation completed, re-rendering...');
+    // Ensure localStorage is synced before re-render
+    if (newProject) {
+      // Force a synchronous read to ensure fresh data
+      renderCurrentView();
+      console.log('Re-render complete');
+    }
   }
 }
 
@@ -1064,17 +1846,29 @@ function closeProjectDetail() {
   renderCurrentView();
 }
 
-function handleDeleteProject(index) {
+async function handleDeleteProject(index) {
   if (confirm('Delete this project permanently?')) {
-    deleteProject(index);
+    await deleteProject(index);
     renderCurrentView();
   }
 }
 
-function handleDeleteProjectFromDetail(index) {
-  if (confirm('Delete this project permanently?')) {
-    deleteProject(index);
-    closeProjectDetail();
+async function handleDeleteProjectFromDetail(index) {
+  // Check if user is owner before allowing deletion
+  if (typeof isProjectOwner === 'function' && !isProjectOwner(index)) {
+    showNotification('Only the project owner can delete this project', 'error');
+    return;
+  }
+
+  if (confirm('Delete this project permanently? This cannot be undone.')) {
+    try {
+      await deleteProject(index);
+      showNotification('Project deleted successfully', 'success');
+      closeProjectDetail();
+    } catch (error) {
+      console.error('Error deleting project:', error);
+      showNotification(error.message || 'Failed to delete project', 'error');
+    }
   }
 }
 
@@ -1089,19 +1883,21 @@ function handleUpdateProjectDescription(index, description) {
 // ============================================
 // Project Task Handlers
 // ============================================
-function handleToggleProjectTask(projectIndex, columnIndex, taskIndex, event) {
+async function handleToggleProjectTask(projectIndex, columnIndex, taskIndex, event) {
   // Prevent event bubbling that could trigger tab switches or other handlers
   if (event) {
     event.stopPropagation();
   }
-  
+
   // Save the current active tab before re-render
   const activeTab = document.querySelector('.pd-tab.active');
   const currentTabName = activeTab ? activeTab.dataset.tab : 'overview';
-  
-  toggleTaskDone(projectIndex, columnIndex, taskIndex);
+
+  // Toggle task done state with attribution (handled by data-store's toggleTaskDone)
+  await toggleTaskDone(projectIndex, columnIndex, taskIndex);
+
   renderCurrentView();
-  
+
   // Restore the active tab if we're in project detail view and timeline was active
   if (currentTabName === 'timeline' && typeof switchProjectTab === 'function') {
     requestAnimationFrame(() => {
@@ -1110,24 +1906,20 @@ function handleToggleProjectTask(projectIndex, columnIndex, taskIndex, event) {
   }
 }
 
-function handleDeleteProjectTask(projectIndex, columnIndex, taskIndex, event) {
+async function handleDeleteProjectTask(projectIndex, columnIndex, taskIndex, event) {
   // Prevent event bubbling that could trigger tab switches
   if (event) {
     event.stopPropagation();
   }
-  
+
   // Save the current active tab before re-render
   const activeTab = document.querySelector('.pd-tab.active');
   const currentTabName = activeTab ? activeTab.dataset.tab : 'overview';
-  
+
   if (confirm('Delete this task?')) {
-    const projects = loadProjects();
-    if (projects[projectIndex]?.columns[columnIndex]?.tasks[taskIndex]) {
-      projects[projectIndex].columns[columnIndex].tasks.splice(taskIndex, 1);
-      saveProjects(projects);
-    }
+    await deleteTask(projectIndex, columnIndex, taskIndex);
     renderCurrentView();
-    
+
     // Restore the active tab if we're in project detail view and timeline was active
     if (currentTabName === 'timeline' && typeof switchProjectTab === 'function') {
       requestAnimationFrame(() => {
@@ -1142,11 +1934,11 @@ function handleAddProjectTaskKeypress(event, projectIndex, columnIndex) {
   if (event) {
     event.stopPropagation();
   }
-  
+
   // Save the current active tab before re-render
   const activeTab = document.querySelector('.pd-tab.active');
   const currentTabName = activeTab ? activeTab.dataset.tab : 'overview';
-  
+
   if (event.key === 'Enter') {
     const input = event.target;
     const title = input.value.trim();
@@ -1154,7 +1946,7 @@ function handleAddProjectTaskKeypress(event, projectIndex, columnIndex) {
       addTaskToColumn(projectIndex, columnIndex, title);
       input.value = '';
       renderCurrentView();
-      
+
       // Restore the active tab if we're in project detail view and timeline was active
       if (currentTabName === 'timeline' && typeof switchProjectTab === 'function') {
         requestAnimationFrame(() => {
@@ -1170,17 +1962,17 @@ function handleAddTaskToColumn(projectIndex, columnIndex, event) {
   if (event) {
     event.stopPropagation();
   }
-  
+
   // Save the current active tab before re-render
   const activeTab = document.querySelector('.pd-tab.active');
   const currentTabName = activeTab ? activeTab.dataset.tab : 'overview';
-  
+
   // Prompt user for task title
   const title = prompt('Enter task title:');
   if (title && title.trim()) {
     addTaskToColumn(projectIndex, columnIndex, title.trim());
     renderCurrentView();
-    
+
     // Restore the active tab if we're in project detail view and timeline was active
     if (currentTabName === 'timeline' && typeof switchProjectTab === 'function') {
       requestAnimationFrame(() => {
@@ -1452,10 +2244,10 @@ function renderActivityView(searchQuery = '') {
       </div>
       
       ${projects.map((project, index) => {
-        const { total, completed, percentage } = calculateProgress(project.columns);
-        const statusColor = getStatusColor(project.status);
-        
-        return `
+    const { total, completed, percentage } = calculateProgress(project.columns);
+    const statusColor = getStatusColor(project.status);
+
+    return `
           <div class="project-card card-hover" onclick="openProjectDetail(${index})">
             <div class="project-card-header">
               <h3 class="project-card-title">${project.name}</h3>
@@ -1480,34 +2272,18 @@ function renderActivityView(searchQuery = '') {
             <div class="project-meta">Target: ${formatDate(project.targetDate)}</div>
           </div>
         `;
-      }).join('')}
+  }).join('')}
     </div>
   `;
 }
 
-function renderTeamView() {
-  return `
-    <div class="team-container">
-      <div class="empty-state">
-        <div class="empty-state-icon">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="width:48px;height:48px;color:var(--muted-foreground);">
-            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
-            <circle cx="9" cy="7" r="4"/>
-            <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
-            <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
-          </svg>
-        </div>
-        <h3 class="empty-state-title">Team collaboration coming soon</h3>
-        <p class="empty-state-text">Invite team members and collaborate on projects together</p>
-      </div>
-    </div>
-  `;
-}
+// renderTeamView() is now defined in functionality.js as a synchronous function
+// This placeholder is removed to use the enhanced version from functionality.js
 
 function renderProjectDetailView(projectIndex) {
   const projects = loadProjects();
   const project = projects[projectIndex];
-  
+
   if (!project) return '';
 
   const { total, completed, percentage } = calculateProgress(project.columns);
@@ -1544,9 +2320,12 @@ function renderProjectDetailView(projectIndex) {
                   Grip Diagram
                 </button>
 
-                <button class="project-detail-delete" onclick="handleDeleteProjectFromDetail(${projectIndex})">
-                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-                </button>
+                <!-- DELETE PROJECT BUTTON - ONLY FOR PROJECT OWNERS -->
+                ${window.isProjectOwner && window.isProjectOwner(projectIndex) ? `
+                  <button class="project-detail-delete" onclick="handleDeleteProjectFromDetail(${projectIndex})" title="Delete project (only project creator can do this)">
+                    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                  </button>
+                ` : ''}
               </div>
             </div>
           </div>
@@ -1564,6 +2343,14 @@ function renderProjectDetailView(projectIndex) {
         <div class="project-description-section">
           <h3 class="section-title">Description</h3>
           <p class="project-description-text" contenteditable="true" onblur="handleUpdateProjectDescription(${projectIndex}, this.textContent)">${project.description || 'Add description...'}</p>
+        </div>
+
+        <!-- Team Members Section -->
+        <div class="pd-team-members">
+          <h3 class="section-title">Team Members</h3>
+          <div class="team-members-list">
+            ${renderTeamMembersList(project, projectIndex)}
+          </div>
         </div>
 
         <div>
@@ -1585,6 +2372,11 @@ function renderProjectDetailView(projectIndex) {
                         </div>
                       </label>
                       <span class="kanban-task-title">${task.title}</span>
+                      ${task.done && task.completed_by ? `
+                        <div class="task-completer-avatar" data-completer-id="${task.completed_by}" title="Loading...">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px;opacity:0.5;"><path d="M20 6L9 17l-5-5"/></svg>
+                        </div>
+                      ` : ''}
                       <button class="kanban-task-delete" onclick="handleDeleteProjectTask(${projectIndex}, ${colIndex}, ${taskIndex}, event)">
                         <svg class="icon" style="width: 14px; height: 14px;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
                       </button>
@@ -1624,9 +2416,14 @@ function renderProjectDetailView(projectIndex) {
             <span class="property-label">Priority</span>
             <span class="property-value" style="color: var(--muted-foreground);">No priority</span>
           </div>
-          <div class="property-item">
+          <div class="property-item" id="projectLeadProperty">
             <span class="property-label">Lead</span>
-            <span class="property-value property-link">Add lead</span>
+            <span class="property-value" id="projectLeadValue" style="display: flex; align-items: center; gap: 8px;">
+              <div class="member-avatar lead-avatar-placeholder" style="width: 24px; height: 24px; font-size: 12px; background: var(--muted); color: var(--muted-foreground); border-radius: 50%; display: flex; align-items: center; justify-content: center;">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px;animation:pulse 1.5s infinite;"><circle cx="12" cy="12" r="3"/></svg>
+              </div>
+              <span class="lead-name-text" style="color: var(--muted-foreground);">Loading...</span>
+            </span>
           </div>
           <div class="property-item">
             <span class="property-label">Target date</span>
@@ -1647,6 +2444,87 @@ function renderProjectDetailView(projectIndex) {
       </aside>
     </div>
   `;
+}
+
+// Render team members list for project detail view
+function renderTeamMembersList(project, projectIndex) {
+  const teamMembers = project.teamMembers || [];
+  const projectMembers = project.projectMembers || [];
+  const isOwner = window.isProjectOwner ? window.isProjectOwner(projectIndex) : false;
+
+  let html = '';
+
+  teamMembers.forEach((member, index) => {
+    const isCurrentUser = member === (window.getCurrentUserEmail ? window.getCurrentUserEmail() : '') || member === 'You';
+    const memberName = member === 'You' ? (window.getCurrentUserName ? window.getCurrentUserName() : 'You') : member;
+    
+    // Find matching project member to get user_id for profile loading
+    const projectMember = projectMembers.find(pm => 
+      (pm.profiles?.email === member) || 
+      (isCurrentUser && pm.user_id === window.LayerDB?.getCurrentUser()?.id)
+    );
+    const userId = projectMember?.user_id;
+
+    html += `
+      <div class="team-member-item ${isCurrentUser ? 'current-user' : ''}" 
+           ${isOwner && !isCurrentUser ? `oncontextmenu="window.showMemberContextMenu ? window.showMemberContextMenu(event, '${member}', ${projectIndex}, ${index}) : ''"` : ''}>
+        <div class="member-avatar team-member-avatar" ${userId ? `data-user-id="${userId}"` : `data-member-email="${member}"`}>
+          ${memberName.charAt(0).toUpperCase()}
+        </div>
+        <div class="member-info">
+          <div class="member-name">${memberName}</div>
+          ${isCurrentUser ? '<div class="member-role">You</div>' : ''}
+        </div>
+      </div>
+    `;
+  });
+
+  if (isOwner) {
+    html += `
+      <button class="btn btn-secondary btn-sm" onclick="window.openInviteMemberModal ? window.openInviteMemberModal(${projectIndex}) : ''">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="12" y1="5" x2="12" y2="19"/>
+          <line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        Add Member
+      </button>
+    `;
+  } else {
+    // Show Leave Project button for non-owners who are team members
+    const currentUserEmail = window.getCurrentUserEmail ? window.getCurrentUserEmail() : '';
+    const isCurrentUserMember = teamMembers.includes(currentUserEmail) || teamMembers.includes('You');
+
+    if (isCurrentUserMember) {
+      html += `
+        <button class="btn btn-danger btn-sm" onclick="window.leaveProject ? window.leaveProject(${projectIndex}) : ''" title="Leave this project">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <polyline points="16,17 21,12 16,7"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+          </svg>
+          Leave Project
+        </button>
+      `;
+    }
+  }
+
+  return html;
+}
+
+// Generate vibrant color based on name
+function getNameColor(name) {
+  // Vibrant color palette
+  const colors = [
+    '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7',
+    '#DDA0DD', '#98D8C8', '#F7DC6F', '#BB8FCE', '#85C1E9',
+    '#F8C471', '#82E0AA', '#F1948A', '#85C1E9', '#D7BDE2'
+  ];
+
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  return colors[Math.abs(hash) % colors.length];
 }
 
 // ============================================
@@ -1697,7 +2575,7 @@ function renderCreateIssueModalContent() {
 
 function renderCreateProjectModalContent() {
   const today = new Date().toISOString().split('T')[0];
-  
+
   return `
     <form id="createProjectForm" onsubmit="handleCreateProjectSubmit(event)">
       <div class="form-group">
@@ -1726,22 +2604,32 @@ function renderCreateProjectModalContent() {
 // ============================================
 // Dashboard Widget Edit Mode
 // ============================================
+// Dashboard Widget Order & Edit Mode
+// ============================================
 let dashboardEditMode = false;
+
+async function initDashboardWidgetOrder() {
+  // Load and apply saved widget order from DB or localStorage
+  const order = await loadWidgetOrder();
+  if (order && order.length > 0) {
+    applyWidgetOrder(order);
+  }
+}
 
 function toggleDashboardEditMode() {
   dashboardEditMode = !dashboardEditMode;
-  
+
   const grid = document.getElementById('dashboardWidgetsGrid');
   const btn = document.getElementById('dashboardEditToggle');
-  
+
   if (grid) {
     grid.classList.toggle('edit-mode', dashboardEditMode);
-    
+
     if (dashboardEditMode) {
       initWidgetDragDrop();
     }
   }
-  
+
   if (btn) {
     btn.classList.toggle('active', dashboardEditMode);
     btn.querySelector('span').textContent = dashboardEditMode ? 'Done' : 'Edit Layout';
@@ -1751,31 +2639,31 @@ function toggleDashboardEditMode() {
 function initWidgetDragDrop() {
   const grid = document.getElementById('dashboardWidgetsGrid');
   if (!grid) return;
-  
+
   const widgets = grid.querySelectorAll('.dashboard-widget');
   let draggedWidget = null;
-  
+
   widgets.forEach(widget => {
     widget.setAttribute('draggable', 'true');
-    
+
     widget.addEventListener('dragstart', (e) => {
       draggedWidget = widget;
       widget.classList.add('dragging');
       e.dataTransfer.effectAllowed = 'move';
     });
-    
+
     widget.addEventListener('dragend', () => {
       widget.classList.remove('dragging');
       draggedWidget = null;
       saveWidgetOrder();
     });
-    
+
     widget.addEventListener('dragover', (e) => {
       e.preventDefault();
       if (draggedWidget && draggedWidget !== widget) {
         const rect = widget.getBoundingClientRect();
         const midX = rect.left + rect.width / 2;
-        
+
         if (e.clientX < midX) {
           widget.parentNode.insertBefore(draggedWidget, widget);
         } else {
@@ -1786,14 +2674,83 @@ function initWidgetDragDrop() {
   });
 }
 
-function saveWidgetOrder() {
+async function saveWidgetOrder() {
   const grid = document.getElementById('dashboardWidgetsGrid');
   if (!grid) return;
-  
+
   const widgets = grid.querySelectorAll('.dashboard-widget');
-  const order = Array.from(widgets).map((w, i) => i);
-  
+  // Store widget IDs in their current order
+  const order = Array.from(widgets).map(w => w.dataset.widgetId || w.querySelector('h3')?.textContent?.trim() || '');
+
+  // Always save to localStorage as fallback
   localStorage.setItem('layerWidgetOrder', JSON.stringify(order));
+
+  // Sync to DB if authenticated
+  if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+    try {
+      await window.LayerDB.saveUserPreferences({ widget_order: order });
+      console.log('✓ Widget order synced to DB');
+    } catch (error) {
+      console.error('Failed to sync widget order to DB:', error);
+    }
+  }
+}
+
+async function loadWidgetOrder() {
+  let order = null;
+
+  // Try to load from DB first if authenticated
+  if (window.LayerDB && window.LayerDB.isAuthenticated()) {
+    try {
+      const prefs = await window.LayerDB.getUserPreferences();
+      if (prefs && prefs.widget_order && Array.isArray(prefs.widget_order) && prefs.widget_order.length > 0) {
+        order = prefs.widget_order;
+        // Cache to localStorage
+        localStorage.setItem('layerWidgetOrder', JSON.stringify(order));
+      }
+    } catch (error) {
+      console.error('Failed to load widget order from DB:', error);
+    }
+  }
+
+  // Fall back to localStorage
+  if (!order) {
+    try {
+      const stored = localStorage.getItem('layerWidgetOrder');
+      if (stored) {
+        order = JSON.parse(stored);
+      }
+    } catch (e) {
+      console.error('Failed to parse widget order from localStorage:', e);
+    }
+  }
+
+  return order;
+}
+
+function applyWidgetOrder(order) {
+  if (!order || !Array.isArray(order) || order.length === 0) return;
+
+  const grid = document.getElementById('dashboardWidgetsGrid');
+  if (!grid) return;
+
+  const widgets = Array.from(grid.querySelectorAll('.dashboard-widget'));
+  if (widgets.length === 0) return;
+
+  // Create a map of widget ID to element
+  const widgetMap = new Map();
+  widgets.forEach(w => {
+    const id = w.dataset.widgetId || w.querySelector('h3')?.textContent?.trim() || '';
+    if (id) widgetMap.set(id, w);
+  });
+
+  // Reorder based on saved order
+  order.forEach(id => {
+    const widget = widgetMap.get(id);
+    if (widget) {
+      grid.appendChild(widget);
+    }
+  });
 }
 
 // ============================================
@@ -1805,11 +2762,11 @@ let whiteboardSplitViewType = null; // 'doc' or 'excel'
 
 function toggleWhiteboardDocSidebar() {
   whiteboardDocSidebarOpen = !whiteboardDocSidebarOpen;
-  
+
   const sidebar = document.getElementById('whiteboardDocSidebar');
   const toggleBtn = document.getElementById('whiteboardDocToggleBtn');
   const splitContainer = document.getElementById('whiteboardSplitContainer');
-  
+
   if (sidebar) {
     sidebar.classList.toggle('open', whiteboardDocSidebarOpen && !whiteboardSplitViewDocId);
     // Remove split-view class when closing
@@ -1823,11 +2780,11 @@ function toggleWhiteboardDocSidebar() {
       updateSplitViewPanel();
     }
   }
-  
+
   if (toggleBtn) {
     toggleBtn.classList.toggle('active', whiteboardDocSidebarOpen);
   }
-  
+
   if (whiteboardDocSidebarOpen) {
     updateWhiteboardDocSidebar();
   }
@@ -1836,42 +2793,42 @@ function toggleWhiteboardDocSidebar() {
 function updateWhiteboardDocSidebar() {
   const container = document.getElementById('whiteboardDocContent');
   if (!container) return;
-  
+
   const projects = loadProjects();
   const project = projects[gripProjectIndex];
-  
+
   if (!project) {
     container.innerHTML = '<div style="padding: 20px; text-align: center; color: var(--muted-foreground);">No project loaded</div>';
     return;
   }
-  
+
   // Get ALL docs and excels from the system
   const allDocs = loadDocs();
   const allExcels = loadExcels();
-  
+
   // Get linked space docs/excels if a space is linked
   const linkedSpace = project.linkedSpaceId ? loadSpaces().find(s => s.id === project.linkedSpaceId) : null;
   const spaceDocs = linkedSpace ? allDocs.filter(d => d.spaceId === linkedSpace.id) : [];
   const spaceExcels = linkedSpace ? allExcels.filter(e => e.spaceId === linkedSpace.id) : [];
-  
+
   // Also get docs that might be directly linked to this project
   const projectDocs = allDocs.filter(d => d.projectId === project.id);
   const projectExcels = allExcels.filter(e => e.projectId === project.id);
-  
+
   // Combine and deduplicate
   const docsMap = new Map();
   [...spaceDocs, ...projectDocs].forEach(d => docsMap.set(d.id, d));
   const docs = Array.from(docsMap.values());
-  
+
   const excelsMap = new Map();
   [...spaceExcels, ...projectExcels].forEach(e => excelsMap.set(e.id, e));
   const excels = Array.from(excelsMap.values());
-  
+
   // If no linked space and no docs, show all available docs
   const showAllDocs = !linkedSpace && docs.length === 0 && excels.length === 0;
   const displayDocs = showAllDocs ? allDocs.slice(0, 10) : docs;
   const displayExcels = showAllDocs ? allExcels.slice(0, 10) : excels;
-  
+
   if (displayDocs.length === 0 && displayExcels.length === 0) {
     container.innerHTML = `
       <div style="padding: 24px; text-align: center;">
@@ -1889,11 +2846,11 @@ function updateWhiteboardDocSidebar() {
     `;
     return;
   }
-  
+
   // Check if we're in split view mode
   const isSplitView = whiteboardSplitViewDocId !== null;
   const listClass = isSplitView ? 'whiteboard-doc-list compact' : 'whiteboard-doc-list';
-  
+
   container.innerHTML = `
     ${showAllDocs ? '<div style="padding: 8px 12px; font-size: 11px; color: #71717a; text-transform: uppercase; letter-spacing: 0.5px;">Recent Documents</div>' : ''}
     <div class="${listClass}">
@@ -1929,10 +2886,10 @@ function updateWhiteboardDocSidebar() {
 
 function renderSplitViewPreview() {
   if (!whiteboardSplitViewDocId) return '';
-  
+
   let doc = null;
   let docType = whiteboardSplitViewType;
-  
+
   if (docType === 'doc') {
     const docs = loadDocs();
     doc = docs.find(d => d.id === whiteboardSplitViewDocId);
@@ -1940,18 +2897,18 @@ function renderSplitViewPreview() {
     const excels = loadExcels();
     doc = excels.find(e => e.id === whiteboardSplitViewDocId);
   }
-  
+
   if (!doc) return '';
-  
+
   return `
     <div class="whiteboard-doc-preview">
       <div class="whiteboard-doc-preview-header">
         <span class="whiteboard-doc-preview-title">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:16px;height:16px;color:${docType === 'excel' ? '#22c55e' : '#3b82f6'};">
-            ${docType === 'excel' ? 
-              '<rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="3" x2="9" y2="21"/>' :
-              '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>'
-            }
+            ${docType === 'excel' ?
+      '<rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="3" x2="9" y2="21"/>' :
+      '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>'
+    }
           </svg>
           ${doc.title || 'Untitled'}
         </span>
@@ -1965,10 +2922,10 @@ function renderSplitViewPreview() {
         </div>
       </div>
       <div class="whiteboard-doc-preview-content">
-        ${docType === 'doc' ? 
-          `<div style="background:#fff;color:#000;padding:20px;border-radius:4px;height:100%;overflow:auto;font-family:serif;line-height:1.8;">${doc.content || '<p style="color:#999;">Empty document</p>'}</div>` :
-          renderExcelPreviewGrid(doc)
-        }
+        ${docType === 'doc' ?
+      `<div style="background:#fff;color:#000;padding:20px;border-radius:4px;height:100%;overflow:auto;font-family:serif;line-height:1.8;">${doc.content || '<p style="color:#999;">Empty document</p>'}</div>` :
+      renderExcelPreviewGrid(doc)
+    }
       </div>
     </div>
   `;
@@ -1978,10 +2935,10 @@ function renderExcelPreviewGrid(excel) {
   if (!excel || !excel.data) {
     return '<div style="padding:20px;color:#999;text-align:center;">No data</div>';
   }
-  
+
   const rows = excel.data.slice(0, 20); // Limit preview rows
   if (rows.length === 0) return '<div style="padding:20px;color:#999;text-align:center;">Empty spreadsheet</div>';
-  
+
   let html = '<table style="width:100%;border-collapse:collapse;background:#fff;color:#000;font-size:12px;">';
   rows.forEach((row, i) => {
     html += '<tr>';
@@ -1998,14 +2955,14 @@ function renderExcelPreviewGrid(excel) {
 function openDocInSplitView(docId) {
   const sidebar = document.getElementById('whiteboardDocSidebar');
   const splitContainer = document.getElementById('whiteboardSplitContainer');
-  
+
   if (sidebar) {
     sidebar.classList.remove('open');
   }
   if (splitContainer) {
     splitContainer.classList.add('split-mode');
   }
-  
+
   whiteboardSplitViewDocId = docId;
   whiteboardSplitViewType = 'doc';
   updateSplitViewPanel();
@@ -2014,14 +2971,14 @@ function openDocInSplitView(docId) {
 function openExcelInSplitView(excelId) {
   const sidebar = document.getElementById('whiteboardDocSidebar');
   const splitContainer = document.getElementById('whiteboardSplitContainer');
-  
+
   if (sidebar) {
     sidebar.classList.remove('open');
   }
   if (splitContainer) {
     splitContainer.classList.add('split-mode');
   }
-  
+
   whiteboardSplitViewDocId = excelId;
   whiteboardSplitViewType = 'excel';
   updateSplitViewPanel();
@@ -2030,16 +2987,16 @@ function openExcelInSplitView(excelId) {
 function closeSplitView() {
   const sidebar = document.getElementById('whiteboardDocSidebar');
   const splitContainer = document.getElementById('whiteboardSplitContainer');
-  
+
   if (splitContainer) {
     splitContainer.classList.remove('split-mode');
   }
-  
+
   whiteboardSplitViewDocId = null;
   whiteboardSplitViewType = null;
   whiteboardDocSidebarOpen = false;
   updateSplitViewPanel();
-  
+
   // Update toggle button state
   const toggleBtn = document.getElementById('whiteboardDocToggleBtn');
   if (toggleBtn) {
@@ -2050,18 +3007,18 @@ function closeSplitView() {
 function updateSplitViewPanel() {
   const panel = document.getElementById('whiteboardDocPanel');
   if (!panel) return;
-  
+
   if (!whiteboardSplitViewDocId) {
     panel.innerHTML = '';
     panel.classList.add('hidden');
     return;
   }
-  
+
   panel.classList.remove('hidden');
-  
+
   let doc = null;
   let docType = whiteboardSplitViewType;
-  
+
   if (docType === 'doc') {
     const docs = loadDocs();
     doc = docs.find(d => d.id === whiteboardSplitViewDocId);
@@ -2069,7 +3026,7 @@ function updateSplitViewPanel() {
     const excels = loadExcels();
     doc = excels.find(e => e.id === whiteboardSplitViewDocId);
   }
-  
+
   if (!doc) {
     panel.innerHTML = `
       <div class="whiteboard-doc-content-empty">
@@ -2082,36 +3039,48 @@ function updateSplitViewPanel() {
     `;
     return;
   }
-  
+
   // Get all docs and excels for the document list
   const allDocs = loadDocs();
   const allExcels = loadExcels();
   const projects = loadProjects();
   const project = projects[gripProjectIndex];
-  
+
   // Filter relevant docs
   const linkedSpace = project?.linkedSpaceId ? loadSpaces().find(s => s.id === project.linkedSpaceId) : null;
   const spaceDocs = linkedSpace ? allDocs.filter(d => d.spaceId === linkedSpace.id) : [];
   const spaceExcels = linkedSpace ? allExcels.filter(e => e.spaceId === linkedSpace.id) : [];
   const projectDocs = project ? allDocs.filter(d => d.projectId === project.id) : [];
   const projectExcels = project ? allExcels.filter(e => e.projectId === project.id) : [];
-  
+
+  // Combine docs, prioritizing space and project docs, then adding recent docs that aren't already included
   const docsMap = new Map();
-  [...spaceDocs, ...projectDocs, ...allDocs.slice(0, 10)].forEach(d => docsMap.set(d.id, d));
+  [...spaceDocs, ...projectDocs].forEach(d => docsMap.set(d.id, d));
+  
+  // Add recent docs that aren't already in space/project categories
+  const recentDocs = allDocs.slice(0, 10).filter(d => !docsMap.has(d.id));
+  recentDocs.forEach(d => docsMap.set(d.id, d));
+  
   const displayDocs = Array.from(docsMap.values()).slice(0, 15);
-  
+
+  // Same for excels
   const excelsMap = new Map();
-  [...spaceExcels, ...projectExcels, ...allExcels.slice(0, 10)].forEach(e => excelsMap.set(e.id, e));
-  const displayExcels = Array.from(excelsMap.values()).slice(0, 15);
+  [...spaceExcels, ...projectExcels].forEach(e => excelsMap.set(e.id, e));
   
+  // Add recent excels that aren't already in space/project categories
+  const recentExcels = allExcels.slice(0, 10).filter(e => !excelsMap.has(e.id));
+  recentExcels.forEach(e => excelsMap.set(e.id, e));
+  
+  const displayExcels = Array.from(excelsMap.values()).slice(0, 15);
+
   panel.innerHTML = `
     <div class="whiteboard-doc-panel-header">
       <div class="whiteboard-doc-panel-title">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          ${docType === 'excel' ? 
-            '<rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="3" x2="9" y2="21"/>' :
-            '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>'
-          }
+          ${docType === 'excel' ?
+      '<rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="3" x2="9" y2="21"/>' :
+      '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/>'
+    }
         </svg>
         ${doc.title || 'Untitled'}
       </div>
@@ -2159,10 +3128,10 @@ function updateSplitViewPanel() {
     
     <!-- Document Content -->
     <div class="whiteboard-doc-content-area">
-      ${docType === 'doc' ? 
-        `<div class="whiteboard-doc-rendered">${doc.content || '<p style="color:#999;">Empty document</p>'}</div>` :
-        renderExcelPreviewGrid(doc)
-      }
+      ${docType === 'doc' ?
+      `<div class="whiteboard-doc-rendered">${doc.content || '<p style="color:#999;">Empty document</p>'}</div>` :
+      renderExcelPreviewGrid(doc)
+    }
     </div>
   `;
 }
@@ -2171,9 +3140,9 @@ function openDocFromWhiteboard(docId) {
   // Close whiteboard temporarily and open doc
   const overlay = document.getElementById('gripDiagramOverlay');
   if (overlay) overlay.style.display = 'none';
-  
+
   openDocEditor(docId);
-  
+
   // Re-show whiteboard when doc is closed
   const checkDocClosed = setInterval(() => {
     if (!document.getElementById('docEditorOverlay')) {
@@ -2186,9 +3155,9 @@ function openDocFromWhiteboard(docId) {
 function openExcelFromWhiteboard(excelId) {
   const overlay = document.getElementById('gripDiagramOverlay');
   if (overlay) overlay.style.display = 'none';
-  
+
   openExcelEditor(excelId);
-  
+
   const checkExcelClosed = setInterval(() => {
     if (!document.getElementById('excelEditorOverlay')) {
       clearInterval(checkExcelClosed);
@@ -2196,3 +3165,375 @@ function openExcelFromWhiteboard(excelId) {
     }
   }, 500);
 }
+
+// Test function to verify profile creation (for debugging)
+window.testProfileCreation = async function () {
+  console.log('Testing profile creation...');
+  try {
+    const user = window.LayerDB.getCurrentUser();
+    if (!user) {
+      console.log('No user logged in');
+      return;
+    }
+
+    console.log('Current user:', user.email);
+
+    // Test profile creation
+    const profile = await window.LayerDB.ensureUserProfile();
+    console.log('Profile ensured:', profile);
+
+    // Verify it exists
+    const { data: verifyProfile } = await window.LayerDB.supabase
+      .from('profiles')
+      .select('*')
+      .eq('email', user.email)
+      .maybeSingle();
+
+    console.log('Verified profile:', verifyProfile);
+
+    if (verifyProfile) {
+      console.log('✅ Profile creation test PASSED');
+    } else {
+      console.log('❌ Profile creation test FAILED');
+    }
+  } catch (error) {
+    console.error('Profile creation test failed:', error);
+  }
+};
+
+// Test function to verify team member addition
+window.testTeamMemberAddition = async function (testEmail = 'test@example.com') {
+  console.log('Testing team member addition...');
+  try {
+    // First ensure we're logged in
+    const user = window.LayerDB.getCurrentUser();
+    if (!user) {
+      console.log('Please log in first');
+      return;
+    }
+
+    // Create a test project if none exists
+    const projects = loadProjects();
+    let testProject = projects.find(p => p.name.includes('Test'));
+
+    if (!testProject) {
+      // Create a test project
+      testProject = {
+        name: 'Test Project for Team Addition',
+        description: 'Temporary project for testing team member addition',
+        status: 'todo',
+        startDate: new Date().toISOString().split('T')[0],
+        targetDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
+        teamMembers: ['You'],
+        columns: [
+          { title: 'To Do', tasks: [] },
+          { title: 'In Progress', tasks: [] },
+          { title: 'Done', tasks: [] }
+        ]
+      };
+
+      projects.push(testProject);
+      saveProjects(projects);
+      console.log('Created test project');
+    }
+
+    const projectIndex = projects.indexOf(testProject);
+    console.log('Using project:', testProject.name);
+
+    // Test adding team member
+    console.log('Adding team member:', testEmail);
+    await window.LayerDB.addTeamMemberToProject(testProject.id, testEmail);
+
+    console.log('✅ Team member addition test PASSED');
+    console.log('Team member added successfully to project');
+
+  } catch (error) {
+    console.error('Team member addition test failed:', error);
+  }
+};
+
+// Test function to verify avatar functionality
+window.testAvatarDisplay = async function () {
+  console.log('Testing avatar display...');
+  try {
+    const user = window.LayerDB.getCurrentUser();
+    if (!user) {
+      console.log('No user logged in');
+      return;
+    }
+
+    console.log('Current user:', user.email);
+    console.log('User metadata:', user.user_metadata);
+
+    // Test profile fetching
+    const profile = await window.LayerDB.getProfile();
+    console.log('User profile:', profile);
+
+    if (profile && profile.avatar_url) {
+      console.log('✅ Avatar URL found:', profile.avatar_url);
+      // Force refresh the user display
+      const displayName = profile.name || user.user_metadata?.name || user.email?.split('@')[0] || 'User';
+      await updateUserDisplay({ username: displayName, email: user.email });
+      console.log('✅ Avatar should now be displayed');
+    } else {
+      console.log('❌ No avatar URL found in profile');
+      console.log('Profile data:', profile);
+    }
+  } catch (error) {
+    console.error('Avatar test failed:', error);
+  }
+};
+
+// Utility to fix all missing profiles (run once)
+window.fixAllMissingProfiles = async function () {
+  console.log('Running profile fix utility...');
+  await window.LayerDB.fixMissingProfiles();
+};
+
+/* ============================================
+   Advanced Focus State Management System
+   Seamless window focus/blur handling
+   ============================================ */
+
+const FocusStateManager = {
+  // State storage
+  savedState: null,
+  focusLostTime: null,
+  isRestoring: false,
+  welcomeBackShown: false,
+  
+  // Save current application state
+  saveAppState() {
+    try {
+      this.savedState = {
+        // Current view and navigation
+        currentView: window.currentView || 'dashboard',
+        currentProjectIndex: window.currentProjectIndex || null,
+        currentDocId: window.currentDocId || null,
+        currentExcelId: window.currentExcelId || null,
+        
+        // Scroll positions
+        scrollX: window.pageXOffset || document.documentElement.scrollLeft,
+        scrollY: window.pageYOffset || document.documentElement.scrollTop,
+        
+        // Active elements and focus
+        activeElement: document.activeElement ? {
+          tagName: document.activeElement.tagName,
+          id: document.activeElement.id,
+          className: document.activeElement.className,
+          selectionStart: document.activeElement.selectionStart,
+          selectionEnd: document.activeElement.selectionEnd
+        } : null,
+        
+        // Modal state
+        openModal: document.querySelector('.modal.active') ? {
+          title: document.querySelector('.modal-title')?.textContent,
+          content: document.querySelector('.modal-body')?.innerHTML
+        } : null,
+        
+        // Sidebar state
+        sidebarCollapsed: document.body.classList.contains('sidebar-collapsed'),
+        
+        // Form inputs and text areas
+        textInputs: Array.from(document.querySelectorAll('input[type="text"], textarea, [contenteditable="true"]')).map(el => ({
+          id: el.id,
+          value: el.value || el.innerText,
+          selectionStart: el.selectionStart,
+          selectionEnd: el.selectionEnd
+        })),
+        
+        // Timestamp
+        savedAt: Date.now()
+      };
+      
+      console.log('🔄 Focus state saved:', this.savedState);
+    } catch (error) {
+      console.error('Failed to save app state:', error);
+    }
+  },
+  
+  // Restore saved application state
+  async restoreAppState() {
+    if (!this.savedState || this.isRestoring) return;
+    
+    this.isRestoring = true;
+    
+    try {
+      console.log('🔄 Restoring focus state:', this.savedState);
+      
+      // Restore view
+      if (this.savedState.currentView && window.currentView !== this.savedState.currentView) {
+        window.currentView = this.savedState.currentView;
+        if (typeof window.renderCurrentView === 'function') {
+          await window.renderCurrentView();
+        }
+      }
+      
+      // Wait a bit for DOM to update
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Restore scroll position
+      if (this.savedState.scrollX !== undefined || this.savedState.scrollY !== undefined) {
+        window.scrollTo(this.savedState.scrollX, this.savedState.scrollY);
+      }
+      
+      // Restore text inputs and contenteditable elements
+      this.savedState.textInputs.forEach(input => {
+        const element = document.getElementById(input.id) || 
+                       document.querySelector(`[contenteditable="true"][id="${input.id}"]`) ||
+                       document.querySelector(`[contenteditable="true"]:contains("${input.value.substring(0, 20)}")`);
+        
+        if (element) {
+          if (element.value !== undefined) {
+            element.value = input.value;
+          } else {
+            element.innerText = input.value;
+          }
+          
+          // Restore cursor position
+          if (input.selectionStart !== undefined) {
+            element.setSelectionRange(input.selectionStart, input.selectionEnd);
+          }
+        }
+      });
+      
+      // Restore active element focus
+      if (this.savedState.activeElement) {
+        const element = document.getElementById(this.savedState.activeElement.id) ||
+                       document.querySelector(this.savedState.activeElement.tagName + 
+                         (this.savedState.activeElement.id ? `#${this.savedState.activeElement.id}` : '') +
+                         (this.savedState.activeElement.className ? `.${this.savedState.activeElement.className.split(' ').join('.')}` : ''));
+        
+        if (element) {
+          element.focus();
+          if (this.savedState.activeElement.selectionStart !== undefined) {
+            element.setSelectionRange(
+              this.savedState.activeElement.selectionStart,
+              this.savedState.activeElement.selectionEnd
+            );
+          }
+        }
+      }
+      
+      // Restore sidebar state
+      if (this.savedState.sidebarCollapsed) {
+        document.body.classList.add('sidebar-collapsed');
+      } else {
+        document.body.classList.remove('sidebar-collapsed');
+      }
+      
+      console.log('✅ Focus state restored successfully');
+      
+    } catch (error) {
+      console.error('Failed to restore app state:', error);
+    } finally {
+      this.isRestoring = false;
+    }
+  },
+  
+  // Show subtle welcome back notification
+  showSubtleWelcomeBack() {
+    if (this.welcomeBackShown) return; // Don't show multiple times
+    
+    this.welcomeBackShown = true;
+    
+    // Create subtle notification
+    const notification = document.createElement('div');
+    notification.style.cssText = `
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      padding: 12px 20px;
+      border-radius: 12px;
+      font-size: 14px;
+      font-weight: 500;
+      box-shadow: 0 4px 20px rgba(102, 126, 234, 0.3);
+      z-index: 10000;
+      opacity: 0;
+      transform: translateY(-10px);
+      transition: all 0.3s ease;
+      pointer-events: none;
+    `;
+    
+    const user = window.LayerDB?.getCurrentUser();
+    const username = user?.user_metadata?.name || user?.email?.split('@')[0] || 'User';
+    notification.innerHTML = `Welcome back, ${username}`;
+    
+    document.body.appendChild(notification);
+    
+    // Animate in
+    setTimeout(() => {
+      notification.style.opacity = '1';
+      notification.style.transform = 'translateY(0)';
+    }, 100);
+    
+    // Animate out and remove
+    setTimeout(() => {
+      notification.style.opacity = '0';
+      notification.style.transform = 'translateY(-10px)';
+      setTimeout(() => {
+        if (notification.parentNode) {
+          notification.parentNode.removeChild(notification);
+        }
+      }, 300);
+    }, 3000);
+    
+    // Reset flag after a delay
+    setTimeout(() => {
+      this.welcomeBackShown = false;
+    }, 5000);
+  },
+  
+  // Initialize focus management
+  initialize() {
+    console.log('🎯 Initializing advanced focus management...');
+    
+    // Save state when window loses focus
+    window.addEventListener('blur', () => {
+      console.log('🔄 Window losing focus - saving state...');
+      this.focusLostTime = Date.now();
+      this.saveAppState();
+    });
+    
+    // Restore state when window gains focus
+    window.addEventListener('focus', async () => {
+      console.log('🔄 Window gaining focus - restoring state...');
+      
+      // Only restore if it's been more than 1 second since focus lost
+      if (this.focusLostTime && (Date.now() - this.focusLostTime) > 1000) {
+        await this.restoreAppState();
+        // Removed showSubtleWelcomeBack() for seamless experience
+      }
+      
+      this.focusLostTime = null;
+    });
+    
+    // Also handle page visibility changes
+    document.addEventListener('visibilitychange', async () => {
+      if (document.hidden) {
+        console.log('🔄 Page becoming hidden - saving state...');
+        this.focusLostTime = Date.now();
+        this.saveAppState();
+      } else {
+        console.log('🔄 Page becoming visible - restoring state...');
+        if (this.focusLostTime && (Date.now() - this.focusLostTime) > 1000) {
+          await this.restoreAppState();
+          // Removed showSubtleWelcomeBack() for seamless experience
+        }
+        this.focusLostTime = null;
+      }
+    });
+    
+    console.log('✅ Advanced focus management initialized');
+  }
+};
+
+// Initialize the focus management system
+document.addEventListener('DOMContentLoaded', () => {
+  FocusStateManager.initialize();
+});
+
+// Make it globally available
+window.FocusStateManager = FocusStateManager;

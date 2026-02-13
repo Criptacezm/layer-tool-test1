@@ -15,7 +15,7 @@ const LEFT_PANEL_WIDTH_KEY = 'layerLeftPanelWidth';
 async function saveLeftPanelWidth(width) {
   try {
     localStorage.setItem(LEFT_PANEL_WIDTH_KEY, width.toString());
-    
+
     // Sync to DB if authenticated
     if (window.LayerDB && window.LayerDB.isAuthenticated()) {
       await window.LayerDB.saveUserPreferences({ left_panel_width: width });
@@ -47,14 +47,14 @@ async function initLeftPanelResize() {
       console.error('Failed to load panel width from DB:', e);
     }
   }
-  
+
   const savedWidth = loadLeftPanelWidth();
   if (savedWidth) {
     document.querySelectorAll('.tl-left-panel-clickup').forEach(panel => {
       panel.style.width = savedWidth + 'px';
     });
   }
-  
+
   // Use ResizeObserver to detect manual resizing
   let resizeTimeout;
   const observer = new ResizeObserver(entries => {
@@ -69,7 +69,7 @@ async function initLeftPanelResize() {
       }
     }
   });
-  
+
   // Observe all left panels
   document.querySelectorAll('.tl-left-panel-clickup').forEach(panel => {
     observer.observe(panel);
@@ -89,110 +89,128 @@ function generateIssueId() {
 }
 
 // ============================================
-// Projects - Use Supabase when authenticated
+// Projects - Supabase as Source of Truth
 // ============================================
 
-// Get projects from localStorage (internal use only)
+// In-memory cache for projects (backed by localStorage for sync access)
+// localStorage is ONLY a read cache - never the source of truth
+
+// Get projects from localStorage cache (for synchronous render calls)
 function loadProjectsFromLocal() {
   try {
     const data = localStorage.getItem(PROJECTS_KEY);
     if (data) {
       const projects = JSON.parse(data);
       return projects.map(project => {
-        // Migration: ensure flowchart exists
-        if (!project.flowchart) {
-          project.flowchart = { nodes: [], edges: [] };
-          if (project.description && project.description.trim()) {
-            project.flowchart.nodes.push({
-              id: 'migrated-text',
-              type: 'flowNode',
-              position: { x: 50, y: 50 },
-              data: { label: project.description.trim(), headerColor: '#89b4fa' }
-            });
-          }
-        }
         project.columns = project.columns || [
           { title: 'To Do', tasks: [] },
           { title: 'In Progress', tasks: [] },
           { title: 'Done', tasks: [] },
         ];
+        project.activity = project.activity || [];
         return project;
       });
     }
   } catch (e) {
-    console.error('Failed to load projects:', e);
+    console.error('Failed to load projects from cache:', e);
   }
   return [];
 }
 
-// Main loadProjects function - uses cached data from localStorage
-// Data is synced to localStorage after DB operations
+// Main loadProjects function - reads from localStorage cache (synchronous)
 function loadProjects() {
-  // When authenticated, we use the cached localStorage data that was
-  // populated from the database during login/data load
   return loadProjectsFromLocal();
 }
 
-function saveProjects(projects) {
+// Update localStorage cache only (NO DB write)
+function saveProjectsToCache(projects) {
   try {
     localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects));
   } catch (e) {
-    console.error('Failed to save projects:', e);
+    console.error('Failed to update projects cache:', e);
   }
 }
 
-// Enhanced save that always syncs to DB when authenticated
-async function saveProjectsWithSync(projects) {
+// DEPRECATED: saveProjects now only updates cache, not DB
+function saveProjects(projects) {
+  saveProjectsToCache(projects);
+}
+
+// Refresh projects from DB and update localStorage cache
+async function refreshProjects() {
+  if (!window.LayerDB || !window.LayerDB.isAuthenticated()) {
+    return loadProjects();
+  }
+
   try {
-    localStorage.setItem(PROJECTS_KEY, JSON.stringify(projects));
-    
-    // Always sync all projects to DB if authenticated
-    if (window.LayerDB && window.LayerDB.isAuthenticated()) {
-      // Sync each project that has an ID (exists in DB)
-      for (const project of projects) {
-        if (project.id) {
-          try {
-            await window.LayerDB.updateProject(project.id, {
-              name: project.name,
-              description: project.description,
-              status: project.status,
-              startDate: project.startDate,
-              targetDate: project.targetDate,
-              flowchart: project.flowchart,
-              columns: project.columns,
-              updates: project.updates,
-              milestones: project.milestones,
-              grip_diagram: project.gripDiagram,
-              tasks: project.tasks
-            });
-          } catch (error) {
-            console.error('Failed to sync project to DB:', project.id, error);
-          }
-        }
-      }
-    }
-  } catch (e) {
-    console.error('Failed to save projects:', e);
+    const projects = await window.LayerDB.loadProjects();
+    saveProjectsToCache(projects);
+    return projects;
+  } catch (error) {
+    console.error('Failed to refresh projects from DB:', error);
+    return loadProjects();
   }
 }
+
+// Make refreshProjects globally available
+window.refreshProjects = refreshProjects;
 
 async function addProject(projectData) {
   // Require authentication - no localStorage fallback
   if (!window.LayerDB || !window.LayerDB.isAuthenticated()) {
-    showToast('Please sign in to create projects', 'error');
+    if (typeof showToast === 'function') {
+      showToast('Please sign in to create projects', 'error');
+    }
     return null;
   }
-  
+
   try {
-    const newProject = await window.LayerDB.saveProject(projectData);
-    // Refresh local cache
+    // Add creator information to project data
+    const currentUser = window.LayerDB.getCurrentUser();
+    const projectWithCreator = {
+      ...projectData,
+      leader: currentUser?.user_metadata?.name || currentUser?.email?.split('@')[0] || 'Project Creator',
+      userEmail: currentUser?.email,
+      user_id: currentUser?.id,
+      teamMembers: [currentUser?.user_metadata?.name || currentUser?.email?.split('@')[0] || 'You'] // Add creator as first team member
+    };
+
+    const newProject = await window.LayerDB.saveProject(projectWithCreator);
+    // Refresh local cache from database
     const projects = await window.LayerDB.loadProjects();
     saveProjects(projects);
+    console.log('Project created with leader:', projectWithCreator.leader, 'localStorage updated with', projects.length, 'projects');
+    if (typeof showNotification === 'function') {
+      showNotification('Project created successfully', 'success');
+    }
     return newProject;
   } catch (error) {
     console.error('Failed to save project to database:', error);
-    showToast('Failed to save project', 'error');
-    return null;
+    // Fallback to localStorage on error
+    const projects = loadProjects();
+    const currentUser = window.LayerDB?.getCurrentUser();
+    const newProject = {
+      ...projectData,
+      id: generateId(),
+      leader: currentUser?.user_metadata?.name || currentUser?.email?.split('@')[0] || 'Project Creator',
+      userEmail: currentUser?.email,
+      user_id: currentUser?.id,
+      teamMembers: [currentUser?.user_metadata?.name || currentUser?.email?.split('@')[0] || 'You'], // Add creator as first team member
+      columns: [
+        { title: 'To Do', tasks: [] },
+        { title: 'In Progress', tasks: [] },
+        { title: 'Done', tasks: [] },
+      ],
+      flowchart: { nodes: [], edges: [] },
+      createdAt: new Date().toISOString()
+    };
+    projects.push(newProject);
+    saveProjects(projects);
+    console.log('Project created locally with leader:', newProject.leader, 'localStorage updated with', projects.length, 'projects');
+    if (typeof showNotification === 'function') {
+      showNotification('Project saved locally (sync failed)', 'warning');
+    }
+    return newProject;
   }
 }
 
@@ -202,9 +220,9 @@ async function updateProject(index, updates) {
     showToast('Please sign in to update projects', 'error');
     return loadProjects();
   }
-  
+
   const projects = loadProjects();
-  
+
   if (projects[index]?.id) {
     try {
       await window.LayerDB.updateProject(projects[index].id, updates);
@@ -216,7 +234,7 @@ async function updateProject(index, updates) {
       showToast('Failed to update project', 'error');
     }
   }
-  
+
   return projects;
 }
 
@@ -226,42 +244,53 @@ async function deleteProject(index) {
     showToast('Please sign in to delete projects', 'error');
     return loadProjects();
   }
-  
+
   const projects = loadProjects();
-  
+
   if (projects[index]?.id) {
     try {
       await window.LayerDB.deleteProject(projects[index].id);
       const updatedProjects = await window.LayerDB.loadProjects();
       saveProjects(updatedProjects);
+      console.log('Project deleted, localStorage updated with', updatedProjects.length, 'projects');
+      if (typeof showNotification === 'function') {
+        showNotification('Project deleted successfully', 'success');
+      }
       return updatedProjects;
     } catch (error) {
       console.error('Failed to delete project from database:', error);
       showToast('Failed to delete project', 'error');
     }
   }
-  
+
   return projects;
 }
 
 // ============================================
-// Project Tasks
+// Project Tasks - DB-first with task attribution
 // ============================================
 async function addTaskToColumn(projectIndex, columnIndex, title) {
   const projects = loadProjects();
   if (projects[projectIndex] && projects[projectIndex].columns[columnIndex]) {
-    projects[projectIndex].columns[columnIndex].tasks.push({
+    const currentUser = window.LayerDB?.getCurrentUser();
+    const newTask = {
       id: generateId('TASK'),
       title: title,
       done: false,
-      createdAt: new Date().toISOString()
-    });
-    saveProjects(projects);
-    
-    // Sync to DB if authenticated
+      createdAt: new Date().toISOString(),
+      created_by: currentUser?.id || null
+    };
+    projects[projectIndex].columns[columnIndex].tasks.push(newTask);
+
+    // Optimistic update to cache
+    saveProjectsToCache(projects);
+
+    // Sync to DB
     if (window.LayerDB && window.LayerDB.isAuthenticated() && projects[projectIndex].id) {
       try {
-        await window.LayerDB.updateProject(projects[projectIndex].id, { columns: projects[projectIndex].columns });
+        await window.LayerDB.updateProject(projects[projectIndex].id, {
+          columns: projects[projectIndex].columns
+        });
       } catch (error) {
         console.error('Failed to sync task to database:', error);
       }
@@ -272,18 +301,47 @@ async function addTaskToColumn(projectIndex, columnIndex, title) {
 
 async function toggleTaskDone(projectIndex, columnIndex, taskIndex) {
   const projects = loadProjects();
-  const task = projects[projectIndex]?.columns[columnIndex]?.tasks[taskIndex];
+  const project = projects[projectIndex];
+  const task = project?.columns[columnIndex]?.tasks[taskIndex];
   if (task) {
+    const currentUser = window.LayerDB?.getCurrentUser();
     task.done = !task.done;
-    saveProjects(projects);
-    
-    // Sync to DB if authenticated
-    if (window.LayerDB && window.LayerDB.isAuthenticated() && projects[projectIndex].id) {
-      try {
-        await window.LayerDB.updateProject(projects[projectIndex].id, { columns: projects[projectIndex].columns });
-      } catch (error) {
+
+    // Add attribution
+    if (task.done) {
+      task.completed_by = currentUser?.id || null;
+      task.completed_at = new Date().toISOString();
+    } else {
+      task.completed_by = null;
+      task.completed_at = null;
+    }
+
+    // Add activity entry
+    if (!project.activity) project.activity = [];
+    project.activity.unshift({
+      user_id: currentUser?.id || null,
+      user_name: currentUser?.user_metadata?.name || currentUser?.email?.split('@')[0] || 'Unknown',
+      action: task.done ? 'completed_task' : 'uncompleted_task',
+      task_title: task.title,
+      column_title: project.columns[columnIndex]?.title || '',
+      timestamp: new Date().toISOString()
+    });
+    // Keep activity log to last 100 entries
+    if (project.activity.length > 100) {
+      project.activity = project.activity.slice(0, 100);
+    }
+
+    // Optimistic update to cache
+    saveProjectsToCache(projects);
+
+    // Sync to DB (don't await for snappy UX)
+    if (window.LayerDB && window.LayerDB.isAuthenticated() && project.id) {
+      window.LayerDB.updateProject(project.id, {
+        columns: project.columns,
+        activity: project.activity
+      }).catch(error => {
         console.error('Failed to sync task toggle to database:', error);
-      }
+      });
     }
   }
   return projects;
@@ -291,14 +349,32 @@ async function toggleTaskDone(projectIndex, columnIndex, taskIndex) {
 
 async function deleteTask(projectIndex, columnIndex, taskIndex) {
   const projects = loadProjects();
-  if (projects[projectIndex]?.columns[columnIndex]?.tasks[taskIndex]) {
-    projects[projectIndex].columns[columnIndex].tasks.splice(taskIndex, 1);
-    saveProjects(projects);
-    
-    // Sync to DB if authenticated
-    if (window.LayerDB && window.LayerDB.isAuthenticated() && projects[projectIndex].id) {
+  const project = projects[projectIndex];
+  if (project?.columns[columnIndex]?.tasks[taskIndex]) {
+    const deletedTask = project.columns[columnIndex].tasks[taskIndex];
+    project.columns[columnIndex].tasks.splice(taskIndex, 1);
+
+    // Add activity entry
+    const currentUser = window.LayerDB?.getCurrentUser();
+    if (!project.activity) project.activity = [];
+    project.activity.unshift({
+      user_id: currentUser?.id || null,
+      user_name: currentUser?.user_metadata?.name || currentUser?.email?.split('@')[0] || 'Unknown',
+      action: 'deleted_task',
+      task_title: deletedTask.title,
+      timestamp: new Date().toISOString()
+    });
+
+    // Optimistic update to cache
+    saveProjectsToCache(projects);
+
+    // Sync to DB
+    if (window.LayerDB && window.LayerDB.isAuthenticated() && project.id) {
       try {
-        await window.LayerDB.updateProject(projects[projectIndex].id, { columns: projects[projectIndex].columns });
+        await window.LayerDB.updateProject(project.id, {
+          columns: project.columns,
+          activity: project.activity
+        });
       } catch (error) {
         console.error('Failed to sync task deletion to database:', error);
       }
@@ -308,18 +384,14 @@ async function deleteTask(projectIndex, columnIndex, taskIndex) {
 }
 
 // ============================================
-// Column Management
+// Column Management - DB-first
 // ============================================
 async function addColumnToProject(projectIndex, title) {
   const projects = loadProjects();
   if (projects[projectIndex]) {
-    projects[projectIndex].columns.push({
-      title: title,
-      tasks: []
-    });
-    saveProjects(projects);
-    
-    // Sync to DB if authenticated
+    projects[projectIndex].columns.push({ title: title, tasks: [] });
+    saveProjectsToCache(projects);
+
     if (window.LayerDB && window.LayerDB.isAuthenticated() && projects[projectIndex].id) {
       try {
         await window.LayerDB.updateProject(projects[projectIndex].id, { columns: projects[projectIndex].columns });
@@ -335,9 +407,8 @@ async function deleteColumnFromProject(projectIndex, columnIndex) {
   const projects = loadProjects();
   if (projects[projectIndex]?.columns[columnIndex]) {
     projects[projectIndex].columns.splice(columnIndex, 1);
-    saveProjects(projects);
-    
-    // Sync to DB if authenticated
+    saveProjectsToCache(projects);
+
     if (window.LayerDB && window.LayerDB.isAuthenticated() && projects[projectIndex].id) {
       try {
         await window.LayerDB.updateProject(projects[projectIndex].id, { columns: projects[projectIndex].columns });
@@ -353,9 +424,8 @@ async function renameColumn(projectIndex, columnIndex, newTitle) {
   const projects = loadProjects();
   if (projects[projectIndex]?.columns[columnIndex]) {
     projects[projectIndex].columns[columnIndex].title = newTitle;
-    saveProjects(projects);
-    
-    // Sync to DB if authenticated
+    saveProjectsToCache(projects);
+
     if (window.LayerDB && window.LayerDB.isAuthenticated() && projects[projectIndex].id) {
       try {
         await window.LayerDB.updateProject(projects[projectIndex].id, { columns: projects[projectIndex].columns });
@@ -403,7 +473,7 @@ async function addBacklogTask(title) {
     showToast('Please sign in to add tasks', 'error');
     return loadBacklogTasks();
   }
-  
+
   try {
     const tasks = await window.LayerDB.addBacklogTask(title);
     saveBacklogTasks(tasks);
@@ -421,20 +491,28 @@ async function toggleBacklogTask(index) {
     showToast('Please sign in to update tasks', 'error');
     return loadBacklogTasks();
   }
-  
+
   const tasks = loadBacklogTasks();
-  
+
   if (tasks[index]?.id) {
     try {
-      const updatedTasks = await window.LayerDB.toggleBacklogTask(tasks[index].id);
-      saveBacklogTasks(updatedTasks);
-      return updatedTasks;
+      // Optimistic update
+      tasks[index].done = !tasks[index].done;
+      saveBacklogTasks(tasks);
+
+      // Sync to DB in background
+      window.LayerDB.toggleBacklogTask(tasks[index].id)
+        .catch(error => {
+          console.error('Failed to toggle backlog task in database:', error);
+          showToast('Failed to sync task update', 'error');
+        });
+
+      return tasks;
     } catch (error) {
-      console.error('Failed to toggle backlog task in database:', error);
-      showToast('Failed to update task', 'error');
+      console.error('Failed to toggle backlog task:', error);
     }
   }
-  
+
   return tasks;
 }
 
@@ -444,9 +522,9 @@ async function updateBacklogTask(index, title) {
     showToast('Please sign in to update tasks', 'error');
     return loadBacklogTasks();
   }
-  
+
   const tasks = loadBacklogTasks();
-  
+
   if (tasks[index]?.id) {
     try {
       const updatedTasks = await window.LayerDB.updateBacklogTask(tasks[index].id, title);
@@ -457,7 +535,7 @@ async function updateBacklogTask(index, title) {
       showToast('Failed to update task', 'error');
     }
   }
-  
+
   return tasks;
 }
 
@@ -467,9 +545,9 @@ async function deleteBacklogTask(index) {
     showToast('Please sign in to delete tasks', 'error');
     return loadBacklogTasks();
   }
-  
+
   const tasks = loadBacklogTasks();
-  
+
   if (tasks[index]?.id) {
     try {
       const updatedTasks = await window.LayerDB.deleteBacklogTask(tasks[index].id);
@@ -480,7 +558,7 @@ async function deleteBacklogTask(index) {
       showToast('Failed to delete task', 'error');
     }
   }
-  
+
   return tasks;
 }
 
@@ -520,7 +598,7 @@ async function addIssue(issueData) {
     showToast('Please sign in to create issues', 'error');
     return loadIssues();
   }
-  
+
   try {
     const issues = await window.LayerDB.addIssue(issueData);
     saveIssues(issues);
@@ -530,6 +608,32 @@ async function addIssue(issueData) {
     showToast('Failed to create issue', 'error');
     return loadIssues();
   }
+}
+
+async function deleteIssue(index) {
+  // Require authentication - no localStorage fallback
+  if (!window.LayerDB || !window.LayerDB.isAuthenticated()) {
+    showToast('Please sign in to delete issues', 'error');
+    return loadIssues();
+  }
+
+  const issues = loadIssues();
+
+  const issue = issues[index];
+  if (issue) {
+    try {
+      // Use dbId (the actual database UUID) if available, otherwise fallback to id
+      const deleteId = issue.dbId || issue.id;
+      const updatedIssues = await window.LayerDB.deleteIssue(deleteId);
+      saveIssues(updatedIssues);
+      return updatedIssues;
+    } catch (error) {
+      console.error('Failed to delete issue from database:', error);
+      showToast('Failed to delete issue', 'error');
+    }
+  }
+
+  return issues;
 }
 
 // ============================================
@@ -636,183 +740,60 @@ function calculateProgress(columns) {
   return { total, completed, percentage };
 }
 
-
 // ============================================
-// PDF Viewer Functions
+// Message Reactions Storage
 // ============================================
-let currentPdfData = null;
-let currentPdfName = '';
 
-function openPdfViewer(dataUrl, fileName) {
-  currentPdfData = dataUrl;
-  currentPdfName = fileName || 'document.pdf';
-  
-  const overlay = document.getElementById('pdfViewerOverlay');
-  const frame = document.getElementById('pdfViewerFrame');
-  const title = document.getElementById('pdfViewerTitle');
-  
-  if (overlay && frame) {
-    title.textContent = currentPdfName;
-    frame.src = dataUrl;
-    overlay.style.display = 'flex';
-    document.body.style.overflow = 'hidden';
+// Save message reactions to localStorage
+function saveMessageReactions(messageId, reactions) {
+  try {
+    const key = `layer_message_reactions_${messageId}`;
+    localStorage.setItem(key, JSON.stringify(reactions));
+  } catch (e) {
+    console.error('Failed to save message reactions:', e);
   }
 }
 
-function closePdfViewer() {
-  const overlay = document.getElementById('pdfViewerOverlay');
-  const frame = document.getElementById('pdfViewerFrame');
-  
-  if (overlay) {
-    overlay.style.display = 'none';
-    document.body.style.overflow = '';
+// Load message reactions from localStorage
+function loadMessageReactions(messageId) {
+  try {
+    const key = `layer_message_reactions_${messageId}`;
+    const reactions = localStorage.getItem(key);
+    return reactions ? JSON.parse(reactions) : {};
+  } catch (e) {
+    console.error('Failed to load message reactions:', e);
+    return {};
   }
-  if (frame) {
-    frame.src = '';
+}
+
+// Clear message reactions from localStorage
+function clearMessageReactions(messageId) {
+  try {
+    const key = `layer_message_reactions_${messageId}`;
+    localStorage.removeItem(key);
+  } catch (e) {
+    console.error('Failed to clear message reactions:', e);
   }
-  currentPdfData = null;
-  currentPdfName = '';
 }
 
-function downloadCurrentPdf() {
-  if (!currentPdfData) return;
-  downloadFile(currentPdfData, currentPdfName);
-}
-
-function downloadFile(dataUrl, fileName) {
-  const link = document.createElement('a');
-  link.href = dataUrl;
-  link.download = fileName;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-}
-
-// Legacy function for backwards compatibility
-function openPdfPreview(dataUrl, fileName) {
-  openPdfViewer(dataUrl, fileName || 'document.pdf');
-}
-
-// Render file item with view and download buttons
-function renderFileItem(file, fileIndex, assignmentIndex) {
-  const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
-  const isImage = file.type.startsWith('image/');
-  const fileSize = formatFileSize(file.size);
-  
-  let previewHtml = '';
-  let actionsHtml = '';
-  
-  if (isPdf) {
-    previewHtml = `
-      <div class="file-icon pdf-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 24px; height: 24px; color: #ef4444;">
-          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-          <polyline points="14 2 14 8 20 8"/>
-          <path d="M10 12h4"/>
-          <path d="M10 16h4"/>
-        </svg>
-      </div>
-    `;
-    actionsHtml = `
-      <button class="btn btn-sm btn-secondary" onclick="openPdfViewer('${file.dataUrl}', '${file.name.replace(/'/g, "\\'")}')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 14px; height: 14px;">
-          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-          <circle cx="12" cy="12" r="3"/>
-        </svg>
-        View
-      </button>
-      <button class="btn btn-sm btn-primary" onclick="downloadFile('${file.dataUrl}', '${file.name.replace(/'/g, "\\'")}')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 14px; height: 14px;">
-          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-          <polyline points="7 10 12 15 17 10"/>
-          <line x1="12" y1="15" x2="12" y2="3"/>
-        </svg>
-        Download
-      </button>
-    `;
-  } else if (isImage) {
-    previewHtml = `
-      <div class="file-thumbnail" style="background-image: url('${file.dataUrl}')"></div>
-    `;
-    actionsHtml = `
-      <button class="btn btn-sm btn-secondary" onclick="openImagePreview('${file.dataUrl}', '${file.name.replace(/'/g, "\\'")}')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 14px; height: 14px;">
-          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-          <circle cx="12" cy="12" r="3"/>
-        </svg>
-        View
-      </button>
-      <button class="btn btn-sm btn-primary" onclick="downloadFile('${file.dataUrl}', '${file.name.replace(/'/g, "\\'")}')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 14px; height: 14px;">
-          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-          <polyline points="7 10 12 15 17 10"/>
-          <line x1="12" y1="15" x2="12" y2="3"/>
-        </svg>
-        Download
-      </button>
-    `;
-  } else {
-    previewHtml = `
-      <div class="file-icon">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 24px; height: 24px;">
-          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-          <polyline points="14 2 14 8 20 8"/>
-        </svg>
-      </div>
-    `;
-    actionsHtml = `
-      <button class="btn btn-sm btn-primary" onclick="downloadFile('${file.dataUrl}', '${file.name.replace(/'/g, "\\'")}')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 14px; height: 14px;">
-          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-          <polyline points="7 10 12 15 17 10"/>
-          <line x1="12" y1="15" x2="12" y2="3"/>
-        </svg>
-        Download
-      </button>
-    `;
+// Get all message reactions for a channel
+function getChannelMessageReactions(channelId) {
+  try {
+    const key = `layer_channel_reactions_${channelId}`;
+    const reactions = localStorage.getItem(key);
+    return reactions ? JSON.parse(reactions) : {};
+  } catch (e) {
+    console.error('Failed to load channel message reactions:', e);
+    return {};
   }
-  
-  return `
-    <div class="file-item">
-      ${previewHtml}
-      <div class="file-info">
-        <span class="file-name">${file.name}</span>
-        <span class="file-size">${fileSize}</span>
-      </div>
-      <div class="file-actions">
-        ${actionsHtml}
-      </div>
-    </div>
-  `;
 }
 
-function openImagePreview(dataUrl, fileName) {
-  const content = `
-    <div style="text-align: center;">
-      <img src="${dataUrl}" alt="${fileName}" style="max-width: 100%; max-height: 70vh; border-radius: 8px;">
-      <div style="margin-top: 16px;">
-        <button class="btn btn-primary" onclick="downloadFile('${dataUrl}', '${fileName.replace(/'/g, "\\'")}')">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width: 14px; height: 14px;">
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-            <polyline points="7 10 12 15 17 10"/>
-            <line x1="12" y1="15" x2="12" y2="3"/>
-          </svg>
-          Download
-        </button>
-      </div>
-    </div>
-  `;
-  openModal(fileName, content);
+// Save all message reactions for a channel
+function saveChannelMessageReactions(channelId, reactions) {
+  try {
+    const key = `layer_channel_reactions_${channelId}`;
+    localStorage.setItem(key, JSON.stringify(reactions));
+  } catch (e) {
+    console.error('Failed to save channel message reactions:', e);
+  }
 }
-
-function formatFileSize(bytes) {
-  if (!bytes) return '0 B';
-  const k = 1024;
-  const sizes = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
-}
-
-// ============================================
-// Project Updates (Comments)
-// ============================================

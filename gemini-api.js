@@ -6,8 +6,8 @@
 
 import { GoogleGenerativeAI } from "https://esm.run/@google/generative-ai";
 
-// API KEY
-const GEMINI_API_KEY = "AIzaSyBRhlJuyVjlX9gb-gN475JmyDi-kkU6BTM";
+// API KEY - Use environment variable for security
+const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || 'AIzaSyBRhlJuyVjlX9gb-gN475JmyDi-kkU6BTM';
 
 // Initialize the API
 const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
